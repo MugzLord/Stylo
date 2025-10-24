@@ -15,7 +15,7 @@ DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)  # neon pink/purple vibe
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = False  # not needed
+INTENTS.message_content = True  # not needed
 INTENTS.guilds = True
 INTENTS.members = True
 
@@ -771,6 +771,8 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
+
+    print(f"[stylo] on_message in #{message.channel.name} from {message.author} | atts={len(message.attachments)}")
 
     # Is this a Stylo ticket channel?
     con = db(); cur = con.cursor()
