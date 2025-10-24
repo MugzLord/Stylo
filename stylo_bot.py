@@ -335,62 +335,77 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         super().__init__()
         self._origin = inter
 
-        async def on_submit(self, inter: discord.Interaction):
-        if not is_admin(inter.user):
-            await inter.response.send_message("Admins only.", ephemeral=True)
-            return
+            async def on_submit(self, inter: discord.Interaction):
+                if not is_admin(inter.user):
+                    await inter.response.send_message("Admins only.", ephemeral=True)
+                    return
+        
+                try:
+                    # parse  "2", "2h", "90m", "1.5h" etc.
+                    entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
+                    vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
+        
+                    theme = str(self.theme).strip()
+                    if not theme:
+                        await inter.response.send_message("Theme is required.", ephemeral=True)
+                        return
+        
+                    entry_end = datetime.now(timezone.utc) + timedelta(seconds=entry_sec)
+        
+                    con = db(); cur = con.cursor()
+                    cur.execute(
+                        "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            inter.guild_id,
+                            theme,
+                            "entry",
+                            entry_end.isoformat(),
+                            int(round(vote_sec/3600)),
+                            int(vote_sec),
+                            0,
+                            inter.channel_id,
+                        ),
+                    )
+                    con.commit(); con.close()
+        
+                    # Build join embed
+                    join_em = discord.Embed(
+                        title=f"✨ Stylo: {theme}",
+                        description=(
+                            "Entries are now **open**!\n"
+                            "Press **Join** to submit your look. Your final image must be posted in your ticket before entries close."
+                        ),
+                        colour=EMBED_COLOUR,
+                    )
+                    join_em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**", inline=True)
+                    join_em.add_field(name="Voting",  value=f"Each round runs **{humanize_seconds(vote_sec)}**",  inline=True)
+        
+                    # View + real button (no decorators on ad-hoc View)
+                    view = discord.ui.View(timeout=None)
+                    join_btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
+        
+                    async def join_callback(btn_inter: discord.Interaction):
+                        if btn_inter.user.bot:
+                            return
+                        await btn_inter.response.send_modal(EntrantModal(btn_inter))
+        
+                    join_btn.callback = join_callback
+                    view.add_item(join_btn)
+        
+                    await inter.response.send_message(embed=join_em, view=view)
+        
+                except Exception as e:
+                    # Surface the actual error so we can see what failed
+                    # (and also print to console)
+                    import traceback, textwrap, sys
+                    traceback.print_exc(file=sys.stderr)
+                    msg = textwrap.shorten(f"Error: {e!r}", width=300)
+                    try:
+                        await inter.response.send_message(msg, ephemeral=True)
+                    except discord.InteractionResponded:
+                        await inter.followup.send(msg, ephemeral=True)
 
-        # parse (accepts 24, 24h, 90m, 1.5h, etc.)
-        try:
-            entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
-            vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
-        except ValueError:
-            await inter.response.send_message(
-                "Please use formats like `24h`, `90m`, `1.5h`, or just `24` (hours by default).",
-                ephemeral=True
-            )
-            return
-
-        theme = str(self.theme).strip()
-        if not theme:
-            await inter.response.send_message("Theme is required.", ephemeral=True)
-            return
-
-        entry_end = datetime.now(timezone.utc) + timedelta(seconds=entry_sec)
-
-        con = db(); cur = con.cursor()
-        cur.execute(
-            "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (inter.guild_id, theme, "entry", entry_end.isoformat(), int(round(vote_sec/3600)), vote_sec, 0, inter.channel_id)
-        )
-        con.commit(); con.close()
-
-        # Build the “Join” embed (this was missing before)
-        join_em = discord.Embed(
-            title=f"✨ Stylo: {theme}",
-            description=(
-                "Entries are now **open**!\n"
-                "Press **Join** to submit your look. Your final image must be posted in your ticket before entries close."
-            ),
-            colour=EMBED_COLOUR
-        )
-        join_em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**", inline=True)
-        join_em.add_field(name="Voting",  value=f"Each round runs **{humanize_seconds(vote_sec)}**",  inline=True)
-
-        # Build a View and a real Button (don’t add a decorated function)
-        view = discord.ui.View(timeout=None)
-        join_btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
-
-        async def join_callback(btn_inter: discord.Interaction):
-            if btn_inter.user.bot:
-                return
-            await btn_inter.response.send_modal(EntrantModal(btn_inter))
-
-        join_btn.callback = join_callback
-        view.add_item(join_btn)
-
-        await inter.response.send_message(embed=join_em, view=view)
 
 
 # ---------- Modal: Entrant info (name, caption) ----------
