@@ -112,11 +112,13 @@ def migrate_db_for_minutes():
     con.close()
 
 init_db()
-migrate_db_for_minutes()
-migrate_add_start_msg_id()
+migrate_db_for_minutes()   # adds vote_seconds
+migrate_db()               # adds ticket_category_id
+migrate_add_start_msg_id() # adds start_msg_id   <-- add this line here
 
 
 def migrate_add_start_msg_id():
+    """Add event.start_msg_id if missing (stores the pinned Join message id)."""
     con = db(); cur = con.cursor()
     cur.execute("PRAGMA table_info(event)")
     cols = {r["name"] for r in cur.fetchall()}
