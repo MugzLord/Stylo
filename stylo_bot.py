@@ -234,6 +234,41 @@ def set_log_channel_id(guild_id: int, channel_id: int | None):
 def is_admin(user: discord.Member) -> bool:
     return user.guild_permissions.manage_guild or user.guild_permissions.administrator
 
+async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str = "Stylo: entries closed"):
+    """Delete all Stylo entry ticket channels for this guild and clear DB rows."""
+    if not guild:
+        return
+    con = db(); cur = con.cursor()
+    try:
+        # Get all ticket channels for this guild
+        cur.execute(
+            "SELECT t.channel_id FROM ticket t "
+            "JOIN entrant e ON e.id = t.entrant_id "
+            "WHERE e.guild_id=?",
+            (guild.id,)
+        )
+        rows = cur.fetchall()
+
+        # Delete channels (best-effort)
+        for r in rows:
+            cid = r["channel_id"]
+            ch = guild.get_channel(cid)
+            if ch:
+                try:
+                    await ch.delete(reason=reason)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)  # be nice to rate limits
+
+        # Clear ticket rows
+        cur.execute(
+            "DELETE FROM ticket WHERE entrant_id IN (SELECT id FROM entrant WHERE guild_id=?)",
+            (guild.id,)
+        )
+        con.commit()
+    finally:
+        con.close()
+
 # ---------- Pillow VS card (no-crop / letterboxed) ----------
 async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
     async with aiohttp.ClientSession() as sess:
@@ -498,7 +533,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 title=f"✨ Stylo: {theme}",
                 description=(
                     "Entries are now **open**!\n"
-                    "Press **Join** to submit your look. Your final image must be posted in your ticket before entries close."
+                    "Press **Join** to submit your look. Your final image (square size) must be posted in your ticket before entries close."
                 ),
                 colour=EMBED_COLOUR,
             )
@@ -619,7 +654,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             info = discord.Embed(
                 title="📸 Submit your outfit image",
                 description=(
-                    "Please upload **one** image for your entry in this channel.\n"
+                    "Please upload **one** Square size image for your entry in this channel.\n"
                     "You may re-upload to replace it — the **last** image before entries close is used.\n"
                     "Spam or unrelated messages may be removed."
                 ),
@@ -981,7 +1016,7 @@ async def scheduler():
                         colour=EMBED_COLOUR
                     )
                     em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                    em.set_image(url="attachment://versus.png")
+                    
                     end_dt = vote_end  # already UTC-aware
                     #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
 
@@ -1002,6 +1037,13 @@ async def scheduler():
                         thread_id = thread.id
                     except Exception:
                         thread_id = None
+
+                    # After posting all Round 1 matches for this guild, delete tickets
+                    try:
+                        await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed — cleanup tickets")
+                    except Exception:
+                        pass
+
 
                     cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
                     con.commit()
@@ -1101,10 +1143,17 @@ async def scheduler():
             byes.append(next_entrants[-1])
 
         new_round = ev["round_index"] + 1
-        vote_end = now + timedelta(hours=ev["vote_hours"])
+        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+        vote_end = now + timedelta(seconds=vote_sec)
+        
         for L, R in pairs:
             cur.execute("INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
                         (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat()))
+        con.commit()
+        
+        # Keep the event cursor’s end time in the same field (used as the round end)
+        cur.execute("UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
+                    (new_round, vote_end.isoformat(), ev["guild_id"]))
         con.commit()
 
         # Move event cursor to voting next round and reuse main channel; re-lock chat
@@ -1113,16 +1162,15 @@ async def scheduler():
         con.commit()
 
         if ch:
-            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-            vote_end = now + timedelta(seconds=vote_sec)
-
+            # Reuse the same vote_end computed above so the announcement matches the match end_utc
             await ch.send(embed=discord.Embed(
                 title=f"🆚 Stylo — Round {new_round} begins!",
                 description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
                             f"Main chat is locked; use each match thread for hype.",
-                
                 colour=EMBED_COLOUR
             ))
+
+            
             default = guild.default_role
             try:
                 await ch.set_permissions(default, send_messages=False)
@@ -1144,8 +1192,7 @@ async def scheduler():
                     colour=EMBED_COLOUR
                 )
                 em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                em.set_image(url="attachment://versus.png")
-
+               
                 end_dt = vote_end  # already timezone-aware UTC
                 #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
                 view = MatchView(m["id"], end_dt, L["name"], R["name"])
