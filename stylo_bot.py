@@ -196,6 +196,8 @@ def set_log_channel_id(guild_id: int, channel_id: int | None):
 def is_admin(user: discord.Member) -> bool:
     return user.guild_permissions.manage_guild or user.guild_permissions.administrator
 
+
+
 # ---------- Pillow VS card ----------
 async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
     async with aiohttp.ClientSession() as sess:
@@ -337,6 +339,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         if not is_admin(inter.user):
             await inter.response.send_message("Admins only.", ephemeral=True); return
 
+        # parse (accepts 24, 24h, 90m, 1.5h, etc.)
         try:
             entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
             vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
@@ -345,39 +348,26 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 "Please use formats like `24h`, `90m`, `1.5h`, or just `24` (hours by default).",
                 ephemeral=True
             )
-            return
-
-        except ValueError:
-            await inter.response.send_message("Use whole numbers for hours.", ephemeral=True); return
-
+            return    
+        
         theme = str(self.theme).strip()
         if not theme:
             await inter.response.send_message("Theme is required.", ephemeral=True); return
-
+        
         entry_end = datetime.now(timezone.utc) + timedelta(seconds=entry_sec)
-
+        
         con = db(); cur = con.cursor()
         cur.execute(
             "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
             "VALUES(?,?,?,?,?,?,?,?)",
             (inter.guild_id, theme, "entry", entry_end.isoformat(), int(round(vote_sec/3600)), vote_sec, 0, inter.channel_id)
         )
-
         con.commit(); con.close()
-
-        # Post Join embed (channel stays open during entry)
-        join_em = discord.Embed(
-            title=f"👗 Stylo — {theme}",
-            description=(
-                "Click **Join** to enter the challenge!\n"
-                "A private ticket will open where you’ll upload **one outfit image**."
-            ),
-            colour=EMBED_COLOUR
-        )
+        
+        # embed fields
         join_em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**", inline=True)
         join_em.add_field(name="Voting",  value=f"Each round runs **{humanize_seconds(vote_sec)}**",  inline=True)
 
-        join_em.set_footer(text="Channel remains open during entries. Voting phase locks main chat.")
 
         view = discord.ui.View(timeout=None)
         @discord.ui.button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
