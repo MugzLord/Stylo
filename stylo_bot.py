@@ -335,9 +335,10 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         super().__init__()
         self._origin = inter
 
-    async def on_submit(self, inter: discord.Interaction):
+        async def on_submit(self, inter: discord.Interaction):
         if not is_admin(inter.user):
-            await inter.response.send_message("Admins only.", ephemeral=True); return
+            await inter.response.send_message("Admins only.", ephemeral=True)
+            return
 
         # parse (accepts 24, 24h, 90m, 1.5h, etc.)
         try:
@@ -348,14 +349,15 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 "Please use formats like `24h`, `90m`, `1.5h`, or just `24` (hours by default).",
                 ephemeral=True
             )
-            return    
-        
+            return
+
         theme = str(self.theme).strip()
         if not theme:
-            await inter.response.send_message("Theme is required.", ephemeral=True); return
-        
+            await inter.response.send_message("Theme is required.", ephemeral=True)
+            return
+
         entry_end = datetime.now(timezone.utc) + timedelta(seconds=entry_sec)
-        
+
         con = db(); cur = con.cursor()
         cur.execute(
             "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
@@ -363,24 +365,33 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             (inter.guild_id, theme, "entry", entry_end.isoformat(), int(round(vote_sec/3600)), vote_sec, 0, inter.channel_id)
         )
         con.commit(); con.close()
-        
-        # embed fields
+
+        # Build the “Join” embed (this was missing before)
+        join_em = discord.Embed(
+            title=f"✨ Stylo: {theme}",
+            description=(
+                "Entries are now **open**!\n"
+                "Press **Join** to submit your look. Your final image must be posted in your ticket before entries close."
+            ),
+            colour=EMBED_COLOUR
+        )
         join_em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**", inline=True)
         join_em.add_field(name="Voting",  value=f"Each round runs **{humanize_seconds(vote_sec)}**",  inline=True)
 
-
+        # Build a View and a real Button (don’t add a decorated function)
         view = discord.ui.View(timeout=None)
-        @discord.ui.button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
-        async def _join_button(btn_inter: discord.Interaction, _btn: discord.ui.Button):
-            # Entrant modal
+        join_btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
+
+        async def join_callback(btn_inter: discord.Interaction):
             if btn_inter.user.bot:
                 return
             await btn_inter.response.send_modal(EntrantModal(btn_inter))
 
-        # attach dynamic button to the view
-        view.add_item(_join_button)  # type: ignore
+        join_btn.callback = join_callback
+        view.add_item(join_btn)
 
         await inter.response.send_message(embed=join_em, view=view)
+
 
 # ---------- Modal: Entrant info (name, caption) ----------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
@@ -807,6 +818,13 @@ async def on_ready():
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    log_id = int(os.getenv("LOG_CHANNEL_ID", "0"))
+    if log_id:
+        ch = bot.get_channel(log_id)
+        if ch:
+            await ch.send("✨ Stylo updated to the latest version and is back online!")
+
 
 if __name__ == "__main__":
     bot.run(TOKEN)
