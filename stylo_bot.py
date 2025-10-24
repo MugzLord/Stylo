@@ -408,7 +408,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------- Modal: Entrant info (name, caption) ----------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="JasmineMoon", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="YaEli", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -482,36 +482,45 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-    # Is this a ticket channel?
+
+    # Is this a Stylo ticket channel?
     con = db(); cur = con.cursor()
-    cur.execute("SELECT entrant.id AS entrant_id, entrant.user_id FROM ticket "
-                "JOIN entrant ON entrant.id = ticket.entrant_id "
-                "WHERE ticket.channel_id=?", (message.channel.id,))
+    cur.execute(
+        "SELECT entrant.id AS entrant_id, entrant.user_id "
+        "FROM ticket JOIN entrant ON entrant.id = ticket.entrant_id "
+        "WHERE ticket.channel_id=?",
+        (message.channel.id,),
+    )
     row = cur.fetchone()
     if not row:
         con.close(); return
 
-    # Only accept the entrant's images
+    # Only accept the entrant's uploads
     if message.author.id != row["user_id"]:
         con.close(); return
     if not message.attachments:
         con.close(); return
 
-    # Take last image-like attachment
-    img = None
-    for a in message.attachments:
-        if a.content_type and a.content_type.startswith("image/"):
-            img = a.url
-    if img:
-        cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img, row["entrant_id"]))
-        con.commit()
-        con.close()
-        try:
-            await message.add_reaction("✅")
-        except Exception:
-            pass
-    else:
-        con.close()
+    # Accept images even when content_type is missing
+    def is_image(att: discord.Attachment) -> bool:
+        if att.content_type and att.content_type.startswith("image/"):
+            return True
+        ext = (att.filename or "").lower().rsplit(".", 1)[-1]
+        return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif"}
+
+    img_url = next((a.url for a in message.attachments if is_image(a)), None)
+    if not img_url:
+        con.close(); return
+
+    cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
+    con.commit(); con.close()
+
+    try:
+        await message.add_reaction("✅")
+        await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used. ")
+    except Exception:
+        pass
+
 
 # ---------- Slash command: /stylo (admin) ----------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
