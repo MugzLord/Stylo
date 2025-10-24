@@ -654,12 +654,15 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             info = discord.Embed(
                 title="📸 Submit your outfit image",
                 description=(
-                    "Please upload **one** Square size image for your entry in this channel.\n"
-                    "You may re-upload to replace it — the **last** image before entries close is used.\n"
-                    "Spam or unrelated messages may be removed."
+                    "Please upload **one** image for your entry in this channel.\n"
+                    "• **Must be square (1:1)**\n"
+                    "• **At least 800px** on the long side\n"
+                    "You may re-upload to replace it - the **last** image before entries close is used.\n"
+                    "If you’re unsure, feel free to ask an Admin for guidance."
                 ),
                 colour=EMBED_COLOUR
             )
+
             await ticket.send(content=inter.user.mention, embed=info)
             await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
 
@@ -860,38 +863,7 @@ async def on_message(message: discord.Message):
     cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
     con.commit(); con.close()
 
-    # Download a tiny chunk to inspect with PIL
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(img_url) as r:
-                raw = await r.read()
-        from PIL import Image
-        im = Image.open(io.BytesIO(raw))
-        w, h = im.size
-        long_side = max(w, h)
-        aspect = w / h if h else 1.0
-    
-        # Soft rules (tweak to taste)
-        if long_side < 800:
-            await message.channel.send(
-                f"{message.author.mention} your image is only {w}×{h}. "
-                "Please upload at least **800px on the long side** for better quality."
-            )
-            return
-    
-        # Optional orientation guard (uncomment if you want portrait-only)
-        # if not (0.75 <= (w / h) <= 0.8):
-        #     await message.channel.send(
-        #         f"{message.author.mention} please use a **portrait image** (~3:4 to 4:5). "
-        #         f"Yours is {w}×{h}."
-        #     )
-        #     return
-    
-    except Exception:
-        # If we can’t inspect, fall back to accepting it
-        pass
-    
-    
+       
         try:
             await message.add_reaction("✅")
             await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used. ")
