@@ -201,7 +201,7 @@ migrate_add_start_msg_id()  # add event.start_msg_id if missing
 def get_ticket_category_id(guild_id: int) -> int | None:
     con = db(); cur = con.cursor()
     cur.execute("SELECT ticket_category_id FROM guild_settings WHERE guild_id=?", (guild_id,))
-    row = con.fetchone(); con.close()
+    row = cur.fetchone(); con.close()  # <-- cur.fetchone()
     return row["ticket_category_id"] if row and row["ticket_category_id"] else None
 
 def set_ticket_category_id(guild_id: int, category_id: int | None):
@@ -530,6 +530,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             # start the countdown updater
             asyncio.create_task(update_entry_embed_countdown(sent, entry_end, vote_sec))
 
+
         except Exception as e:
             import traceback, textwrap, sys
             traceback.print_exc(file=sys.stderr)
@@ -538,9 +539,75 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 await inter.response.send_message(msg, ephemeral=True)
             except discord.InteractionResponded:
                 await inter.followup.send(msg, ephemeral=True)
-            return  # <<< prevent stray block below from running on error
+            return  # <-- keep your original block below, but ensure it won’t run on error
 
-            # (left intentionally: original pasted block)
+            # Target category (optional)
+            category = None
+            cat_id = get_ticket_category_id(guild.id)
+            if cat_id:
+                maybe = guild.get_channel(cat_id)
+                if isinstance(maybe, discord.CategoryChannel):
+                    # Hard limit 50 + ensure the bot can see & manage inside that category
+                    perms = maybe.permissions_for(guild.me)
+                    if not (perms.view_channel and perms.manage_channels):
+                        # tell user exactly what's missing
+                        missing = []
+                        if not perms.view_channel: missing.append("View Channel (category)")
+                        if not perms.manage_channels: missing.append("Manage Channels (category)")
+                        con.close()
+                        await inter.response.send_message(
+                            "I can’t create your ticket in the selected category — missing: **"
+                            + ", ".join(missing) + "**. "
+                            "Ask an admin to fix the category permissions or re-run `/stylo_settings set_ticket_category`.",
+                            ephemeral=True
+                        ); return
+                    if len(maybe.channels) >= 50:
+                        con.close()
+                        await inter.response.send_message(
+                            "The ticket category is full (50 channels). Set a new one with "
+                            "`/stylo_settings set_ticket_category`.", ephemeral=True
+                        ); return
+                    category = maybe
+                # if not a category, treat as None (fallback below)
+
+            # Overwrites for the ticket
+            default = guild.default_role
+            admin_roles = [r for r in guild.roles if r.permissions.administrator]
+            overwrites = {
+                default:   discord.PermissionOverwrite(view_channel=False),
+                guild.me:  discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True),
+                inter.user:discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True),
+            }
+            for r in admin_roles:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True)
+
+            ticket_name = f"stylo-entry-{inter.user.name}".lower()[:90]
+
+            # Try creating in the chosen category; if it fails, fallback to no category
+            try:
+                ticket = await guild.create_text_channel(
+                    ticket_name, overwrites=overwrites, reason="Stylo entry ticket", category=category
+                )
+            except discord.Forbidden:
+                # fallback: create at guild root where the bot can manage
+                ticket = await guild.create_text_channel(
+                    ticket_name, overwrites=overwrites, reason="Stylo entry ticket (fallback)"
+                )
+
+            cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
+            con.commit(); con.close()
+
+            info = discord.Embed(
+                title="📸 Submit your outfit image",
+                description=(
+                    "Please upload **one** image for your entry in this channel.\n"
+                    "You may re-upload to replace it — the **last** image before entries close is used.\n"
+                    "Spam or unrelated messages may be removed."
+                ),
+                colour=EMBED_COLOUR
+            )
+            await ticket.send(content=inter.user.mention, embed=info)
+            await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
 
         except Exception as e:
             import traceback, textwrap, sys
@@ -1000,7 +1067,7 @@ async def scheduler():
                 em.set_image(url="attachment://versus.png")
 
                 end_dt = vote_end  # already timezone-aware UTC
-                em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")  # footer for next rounds too
+                em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
                 view = MatchView(m["id"], end_dt, L["name"], R["name"])
                 msg = await ch.send(embed=em, view=view, file=file)
 
