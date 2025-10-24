@@ -100,8 +100,6 @@ def init_db():
     )
     con.commit(); con.close()
 
-init_db()
-
 def migrate_db_for_minutes():
     con = db(); cur = con.cursor()
     cur.execute("PRAGMA table_info(event)")
@@ -110,13 +108,6 @@ def migrate_db_for_minutes():
         cur.execute("ALTER TABLE event ADD COLUMN vote_seconds INTEGER")
         con.commit()
     con.close()
-
-# ---- run DB setup once (order matters; keep this BELOW the function defs) ----
-init_db()
-migrate_db_for_minutes()   # adds event.vote_seconds
-migrate_db()               # adds guild_settings.ticket_category_id (your existing helper)
-migrate_add_start_msg_id() # adds event.start_msg_id
-
 
 
 def migrate_add_start_msg_id():
@@ -128,11 +119,6 @@ def migrate_add_start_msg_id():
         cur.execute("ALTER TABLE event ADD COLUMN start_msg_id INTEGER")
         con.commit()
     con.close()
-
-
-def rel_ts(dt_utc: datetime) -> str:
-    # dt_utc must be timezone-aware UTC
-    return f"<t:{int(dt_utc.timestamp())}:R>"
 
 def rel_ts(dt_utc: datetime) -> str:
     """Return a Discord relative timestamp like '<t:1699999999:R>'."""
@@ -205,9 +191,12 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
     return view
 
 
-# Call after init_db()
+# ---- DB setup (call once, after all helpers are defined) ----
 init_db()
-migrate_db()
+migrate_db()                # add guild_settings.ticket_category_id if missing
+migrate_db_for_minutes()    # add event.vote_seconds if missing
+migrate_add_start_msg_id()  # add event.start_msg_id if missing
+
 
 def get_ticket_category_id(guild_id: int) -> int | None:
     con = db(); cur = con.cursor()
@@ -915,10 +904,10 @@ async def scheduler():
                     )
                     em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                     em.set_image(url="attachment://versus.png")
+                    end_dt = vote_end  # already UTC-aware
                     em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
 
-
-                    end_dt = vote_end  # already UTC-aware
+                    
                     view = MatchView(m["id"], end_dt, L["name"], R["name"])
 
                     msg = await ch.send(embed=em, view=view, file=file)
@@ -1113,13 +1102,6 @@ import os
 
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
-@bot.event
-async def on_ready():
-    ...
-    if LOG_CHANNEL_ID:
-        channel = bot.get_channel(LOG_CHANNEL_ID)
-        if channel:
-            await channel.send("✨ Stylo updated to the latest version and is back online!")
 @settings_group.command(name="set_ticket_category", description="Set the category where Stylo will create entry tickets.")
 @app_commands.describe(category="Choose a category for entry ticket channels.")
 async def stylo_set_ticket_category(inter: discord.Interaction, category: discord.CategoryChannel):
