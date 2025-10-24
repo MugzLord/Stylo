@@ -87,6 +87,14 @@ def init_db():
             PRIMARY KEY (match_id, user_id),
             FOREIGN KEY(match_id) REFERENCES match(id) ON DELETE CASCADE
         );
+        
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id       INTEGER PRIMARY KEY,
+            log_channel_id INTEGER,
+            ticket_category_id INTEGER
+        );
+
+        
         """
     )
     con.commit(); con.close()
@@ -94,6 +102,22 @@ def init_db():
 init_db()
 
 # ---------- Permissions helper ----------
+def get_ticket_category_id(guild_id: int) -> int | None:
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT ticket_category_id FROM guild_settings WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone(); con.close()
+    return row["ticket_category_id"] if row and row["ticket_category_id"] else None
+
+def set_ticket_category_id(guild_id: int, category_id: int | None):
+    con = db(); cur = con.cursor()
+    if category_id is None:
+        cur.execute("UPDATE guild_settings SET ticket_category_id=NULL WHERE guild_id=?", (guild_id,))
+    else:
+        cur.execute("INSERT INTO guild_settings(guild_id, ticket_category_id) VALUES(?,?) "
+                    "ON CONFLICT(guild_id) DO UPDATE SET ticket_category_id=excluded.ticket_category_id",
+                    (guild_id, category_id))
+    con.commit(); con.close()
+
 def get_log_channel_id(guild_id: int) -> int | None:
     con = db(); cur = con.cursor()
     cur.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", (guild_id,))
@@ -346,7 +370,15 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True)
 
         ticket_name = f"stylo-entry-{inter.user.name}".lower()[:90]
-        ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket")
+        category_id = get_ticket_category_id(guild.id)
+        category = guild.get_channel(category_id) if category_id else None
+        ticket = await guild.create_text_channel(
+            ticket_name,
+            overwrites=overwrites,
+            reason="Stylo entry ticket",
+            category=category
+        )
+
         cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
         con.commit(); con.close()
 
@@ -678,6 +710,23 @@ async def on_ready():
         channel = bot.get_channel(LOG_CHANNEL_ID)
         if channel:
             await channel.send("✨ Stylo updated to the latest version and is back online!")
+@settings_group.command(name="set_ticket_category", description="Set the category where Stylo will create entry tickets.")
+@app_commands.describe(category="Choose a category for entry ticket channels.")
+async def stylo_set_ticket_category(inter: discord.Interaction, category: discord.CategoryChannel):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    set_ticket_category_id(inter.guild_id, category.id)
+    await inter.response.send_message(f"✅ Ticket category set to **{category.name}**", ephemeral=True)
+
+@settings_group.command(name="show_ticket_category", description="Show the currently configured ticket category.")
+async def stylo_show_ticket_category(inter: discord.Interaction):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    cat_id = get_ticket_category_id(inter.guild_id)
+    mention = f"<#{cat_id}>" if cat_id else "— not set —"
+    em = discord.Embed(title="Stylo Settings", colour=EMBED_COLOUR)
+    em.add_field(name="Ticket Category", value=mention, inline=False)
+    await inter.response.send_message(embed=em, ephemeral=True)
 
 
 # ---------- Ready ----------
