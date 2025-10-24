@@ -118,6 +118,15 @@ def rel_ts(dt_utc: datetime) -> str:
     # dt_utc must be timezone-aware UTC
     return f"<t:{int(dt_utc.timestamp())}:R>"
 
+def rel_ts(dt_utc: datetime) -> str:
+    """Return a Discord relative timestamp like '<t:1699999999:R>'."""
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt_utc.astimezone(timezone.utc)
+    return f"<t:{int(dt_utc.timestamp())}:R>"
+
+
 # ---------- Permissions helper ----------
 import re
 
@@ -328,7 +337,6 @@ async def stylo_show_settings(inter: discord.Interaction):
 # Register the group
 bot.tree.add_command(settings_group)
 
-
 # ---------- Modal: Admin start ----------
 class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
     theme = discord.ui.TextInput(label="Theme / Title", placeholder="Enchanted Garden", max_length=100)
@@ -340,35 +348,85 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         self._origin = inter
 
     async def on_submit(self, inter: discord.Interaction):
-        if not inter.guild:
-            await inter.response.send_message("Guild context missing.", ephemeral=True); return
+        if not is_admin(inter.user):
+            await inter.response.send_message("Admins only.", ephemeral=True)
+            return
 
         try:
-            con = db(); cur = con.cursor()
+            # parse "2", "2h", "90m", "1.5h" etc.
+            entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
+            vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
 
-            # Ensure entries are open
-            cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
-            ev = cur.fetchone()
-            if not ev or ev["state"] != "entry":
-                con.close()
-                await inter.response.send_message("Entries are not open.", ephemeral=True)
+            theme = str(self.theme).strip()
+            if not theme:
+                await inter.response.send_message("Theme is required.", ephemeral=True)
                 return
 
-            # Upsert entrant
-            name = str(self.display_name).strip()
-            cap  = (str(self.caption).strip() if self.caption is not None else "")
+            now_utc   = datetime.now(timezone.utc)
+            entry_end = now_utc + timedelta(seconds=entry_sec)
+
+            con = db(); cur = con.cursor()
+            cur.execute(
+                "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    inter.guild_id,
+                    theme,
+                    "entry",
+                    entry_end.isoformat(),
+                    int(round(vote_sec/3600)),
+                    int(vote_sec),
+                    0,
+                    inter.channel_id,
+                ),
+            )
+            con.commit(); con.close()
+
+            # Build the Join embed (with countdowns)
+            join_em = discord.Embed(
+                title=f"✨ Stylo: {theme}",
+                description=(
+                    "Entries are now **open**!\n"
+                    "Press **Join** to submit your look. Your final image must be posted in your ticket before entries close."
+                ),
+                colour=EMBED_COLOUR,
+            )
+            join_em.add_field(
+                name="Entries",
+                value=f"Open for **{humanize_seconds(entry_sec)}**\nCloses {rel_ts(entry_end)}",
+                inline=True,
+            )
+            # Show example voting duration so folks know the cadence
+            vote_preview_end = now_utc + timedelta(seconds=vote_sec)
+            join_em.add_field(
+                name="Voting",
+                value=f"Each round runs **{humanize_seconds(vote_sec)}**\nExample close {rel_ts(vote_preview_end)}",
+                inline=True,
+            )
+
+            # View + working Join button
+            view = discord.ui.View(timeout=None)
+            join_btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
+
+            async def join_callback(btn_inter: discord.Interaction):
+                if btn_inter.user.bot:
+                    return
+                await btn_inter.response.send_modal(EntrantModal(btn_inter))
+
+            join_btn.callback = join_callback
+            view.add_item(join_btn)
+
+            await inter.response.send_message(embed=join_em, view=view)
+
+        except Exception as e:
+            import traceback, textwrap, sys
+            traceback.print_exc(file=sys.stderr)
+            msg = textwrap.shorten(f"Error: {e!r}", width=300)
             try:
-                cur.execute("INSERT INTO entrant(guild_id, user_id, name, caption) VALUES(?,?,?,?)",
-                            (inter.guild_id, inter.user.id, name, cap))
-            except sqlite3.IntegrityError:
-                cur.execute("UPDATE entrant SET name=?, caption=? WHERE guild_id=? AND user_id=?",
-                            (name, cap, inter.guild_id, inter.user.id))
-            con.commit()
+                await inter.response.send_message(msg, ephemeral=True)
+            except discord.InteractionResponded:
+                await inter.followup.send(msg, ephemeral=True)
 
-            cur.execute("SELECT id FROM entrant WHERE guild_id=? AND user_id=?", (inter.guild_id, inter.user.id))
-            entrant_id = cur.fetchone()["id"]
-
-            guild = inter.guild
 
             # Target category (optional)
             category = None
@@ -447,10 +505,9 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             except discord.InteractionResponded:
                 await inter.followup.send(msg, ephemeral=True)
 
-
 # ---------- Modal: Entrant info (name, caption) ----------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="YaEli", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="JasmineMoon", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -458,66 +515,115 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
         self._origin = inter
 
     async def on_submit(self, inter: discord.Interaction):
-        con = db(); cur = con.cursor()
-        # Ensure event is in entry phase
-        cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
-        ev = cur.fetchone()
-        if not ev or ev["state"] != "entry":
-            await inter.response.send_message("Entries are not open.", ephemeral=True)
-            con.close(); return
+        if not inter.guild:
+            await inter.response.send_message("Guild context missing.", ephemeral=True); return
 
-        # Upsert entrant
-        name = str(self.display_name).strip()
-        cap = str(self.caption).strip()
         try:
-            cur.execute("INSERT INTO entrant(guild_id, user_id, name, caption) VALUES(?,?,?,?)",
-                        (inter.guild_id, inter.user.id, name, cap))
-        except sqlite3.IntegrityError:
-            # already exists; update name/caption
-            cur.execute("UPDATE entrant SET name=?, caption=? WHERE guild_id=? AND user_id=?",
-                        (name, cap, inter.guild_id, inter.user.id))
-        con.commit()
+            con = db(); cur = con.cursor()
 
-        # (Re)fetch entrant id
-        cur.execute("SELECT id FROM entrant WHERE guild_id=? AND user_id=?", (inter.guild_id, inter.user.id))
-        entrant_id = cur.fetchone()["id"]
+            # Ensure event is open
+            cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
+            ev = cur.fetchone()
+            if not ev or ev["state"] != "entry":
+                con.close()
+                await inter.response.send_message("Entries are not open.", ephemeral=True)
+                return
 
-        # Create private ticket channel (entrant + admins)
-        guild = inter.guild
-        default = guild.default_role
-        admin_roles = [r for r in guild.roles if r.permissions.administrator]
-        overwrites = {
-            default: discord.PermissionOverwrite(view_channel=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            inter.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True),
-        }
-        for r in admin_roles:
-            overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True)
+            # Upsert entrant
+            name = str(self.display_name).strip()
+            cap  = (str(self.caption).strip() if self.caption is not None else "")
+            try:
+                cur.execute(
+                    "INSERT INTO entrant(guild_id, user_id, name, caption) VALUES(?,?,?,?)",
+                    (inter.guild_id, inter.user.id, name, cap)
+                )
+            except sqlite3.IntegrityError:
+                cur.execute(
+                    "UPDATE entrant SET name=?, caption=? WHERE guild_id=? AND user_id=?",
+                    (name, cap, inter.guild_id, inter.user.id)
+                )
+            con.commit()
 
-        ticket_name = f"stylo-entry-{inter.user.name}".lower()[:90]
-        category_id = get_ticket_category_id(guild.id)
-        category = guild.get_channel(category_id) if category_id else None
-        ticket = await guild.create_text_channel(
-            ticket_name,
-            overwrites=overwrites,
-            reason="Stylo entry ticket",
-            category=category
-        )
+            cur.execute("SELECT id FROM entrant WHERE guild_id=? AND user_id=?", (inter.guild_id, inter.user.id))
+            entrant_id = cur.fetchone()["id"]
 
-        cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
-        con.commit(); con.close()
+            guild = inter.guild
 
-        info = discord.Embed(
-            title="📸 Submit your outfit image",
-            description=(
-                "Please upload **one** image for your entry in this channel.\n"
-                "You may re-upload to replace it — the **last** image before entries close is used.\n"
-                "Spam or unrelated messages may be removed."
-            ),
-            colour=EMBED_COLOUR
-        )
-        await ticket.send(content=inter.user.mention, embed=info)
-        await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
+            # Resolve category (optional) and validate perms/limits
+            category = None
+            cat_id = get_ticket_category_id(guild.id)
+            if cat_id:
+                maybe = guild.get_channel(cat_id)
+                if isinstance(maybe, discord.CategoryChannel):
+                    perms = maybe.permissions_for(guild.me)
+                    if not (perms.view_channel and perms.manage_channels):
+                        missing = []
+                        if not perms.view_channel: missing.append("View Channel (category)")
+                        if not perms.manage_channels: missing.append("Manage Channels (category)")
+                        con.close()
+                        await inter.response.send_message(
+                            "I can’t create your ticket in the selected category — missing: **"
+                            + ", ".join(missing) + "**.\n"
+                            "Ask an admin to fix the category permissions or set a new one with "
+                            "`/stylo_settings set_ticket_category`.",
+                            ephemeral=True
+                        ); return
+                    if len(maybe.channels) >= 50:
+                        con.close()
+                        await inter.response.send_message(
+                            "The ticket category is full (50 channels). Set a new one with "
+                            "`/stylo_settings set_ticket_category`.",
+                            ephemeral=True
+                        ); return
+                    category = maybe
+
+            # Overwrites
+            default = guild.default_role
+            admin_roles = [r for r in guild.roles if r.permissions.administrator]
+            overwrites = {
+                default:   discord.PermissionOverwrite(view_channel=False),
+                guild.me:  discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True),
+                inter.user:discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True),
+            }
+            for r in admin_roles:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True)
+
+            ticket_name = f"stylo-entry-{inter.user.name}".lower()[:90]
+
+            # Try category; if forbidden, fallback to root
+            try:
+                ticket = await guild.create_text_channel(
+                    ticket_name, overwrites=overwrites, reason="Stylo entry ticket", category=category
+                )
+            except discord.Forbidden:
+                ticket = await guild.create_text_channel(
+                    ticket_name, overwrites=overwrites, reason="Stylo entry ticket (fallback)"
+                )
+
+            cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
+            con.commit(); con.close()
+
+            info = discord.Embed(
+                title="📸 Submit your outfit image",
+                description=(
+                    "Please upload **one** image for your entry in this channel.\n"
+                    "You may re-upload to replace it — the **last** image before entries close is used.\n"
+                    "Spam or unrelated messages may be removed."
+                ),
+                colour=EMBED_COLOUR
+            )
+            await ticket.send(content=inter.user.mention, embed=info)
+            await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
+
+        except Exception as e:
+            import traceback, textwrap, sys
+            traceback.print_exc(file=sys.stderr)
+            msg = textwrap.shorten(f"Join failed: {e!r}", width=300)
+            try:
+                await inter.response.send_message(msg, ephemeral=True)
+            except discord.InteractionResponded:
+                await inter.followup.send(msg, ephemeral=True)
+
 
 # ---------- Message listener: capture image in ticket ----------
 @bot.event
@@ -621,9 +727,13 @@ async def scheduler():
 
                 await ch.send(embed=discord.Embed(
                     title=f"🆚 Stylo — Round {round_index} begins!",
-                    description=f"All matches posted. Voting closes in **{ev['vote_hours']}h**.\nMain chat is locked; use each match thread for hype.",
+                    description=(
+                        f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
+                        "Main chat is locked; use each match thread for hype."
+                    ),
                     colour=EMBED_COLOUR
                 ))
+
                 # Lock main channel chat
                 default = guild.default_role
                 try:
@@ -650,6 +760,8 @@ async def scheduler():
                     )
                     em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                     em.set_image(url="attachment://versus.png")
+                    em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
+
 
                     end_dt = datetime.fromisoformat(vote_end.isoformat()).replace(tzinfo=timezone.utc)
                     view = MatchView(m["id"], end_dt, L["name"], R["name"])
