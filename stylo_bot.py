@@ -102,6 +102,24 @@ def init_db():
 init_db()
 
 # ---------- Permissions helper ----------
+def migrate_db():
+    con = db(); cur = con.cursor()
+    # Add ticket_category_id if the column is missing
+    cur.execute("PRAGMA table_info(guild_settings)")
+    cols = {row["name"] for row in cur.fetchall()}
+    if "ticket_category_id" not in cols:
+        try:
+            cur.execute("ALTER TABLE guild_settings ADD COLUMN ticket_category_id INTEGER")
+            con.commit()
+            print("DB migrated: added guild_settings.ticket_category_id")
+        except Exception as e:
+            print("Migration error:", e)
+    con.close()
+
+# Call after init_db()
+init_db()
+migrate_db()
+
 def get_ticket_category_id(guild_id: int) -> int | None:
     con = db(); cur = con.cursor()
     cur.execute("SELECT ticket_category_id FROM guild_settings WHERE guild_id=?", (guild_id,))
