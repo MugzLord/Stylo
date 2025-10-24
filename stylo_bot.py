@@ -22,6 +22,7 @@ INTENTS.members = True
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # ---------- SQLite helpers ----------
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -101,7 +102,40 @@ def init_db():
 
 init_db()
 
+def migrate_db_for_minutes():
+    con = db(); cur = con.cursor()
+    cur.execute("PRAGMA table_info(event)")
+    cols = {r["name"] for r in cur.fetchall()}
+    if "vote_seconds" not in cols:
+        cur.execute("ALTER TABLE event ADD COLUMN vote_seconds INTEGER")
+        con.commit()
+    con.close()
+
+init_db()
+migrate_db_for_minutes()
+
 # ---------- Permissions helper ----------
+import re
+
+def parse_duration_to_seconds(text: str, default_unit="h") -> int:
+    """
+    Accepts values like: 24, 24h, 1.5h, 90m, 45 m, .5h
+    Returns total seconds (int). default_unit is used when no suffix is provided.
+    """
+    s = (text or "").strip().lower().replace(" ", "")
+    if not s:
+        raise ValueError("empty duration")
+    m = re.match(r"^([0-9]*\.?[0-9]+)([mh])?$", s)
+    if not m:
+        # allow pure '-' etc to fail cleanly
+        raise ValueError("invalid duration format")
+    val = float(m.group(1))
+    unit = m.group(2) or default_unit
+    minutes = val * (60 if unit == "h" else 1)
+    seconds = int(round(minutes * 60))
+    # bound it a bit to avoid accidents
+    return max(60, min(seconds, 60 * 60 * 24 * 10))  # 1 minute .. 10 days
+
 def migrate_db():
     con = db(); cur = con.cursor()
     # Add ticket_category_id if the column is missing
@@ -115,6 +149,12 @@ def migrate_db():
         except Exception as e:
             print("Migration error:", e)
     con.close()
+
+def humanize_seconds(sec: int) -> str:
+    m = round(sec / 60)
+    if m % 60 == 0:
+        return f"{m//60}h"
+    return f"{m}m"
 
 # Call after init_db()
 init_db()
@@ -298,8 +338,15 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             await inter.response.send_message("Admins only.", ephemeral=True); return
 
         try:
-            eh = max(1, min(240, int(str(self.entry_hours))))
-            vh = max(1, min(240, int(str(self.vote_hours))))
+            entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
+            vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
+        except ValueError:
+            await inter.response.send_message(
+                "Please use formats like `24h`, `90m`, `1.5h`, or just `24` (hours by default).",
+                ephemeral=True
+            )
+            return
+
         except ValueError:
             await inter.response.send_message("Use whole numbers for hours.", ephemeral=True); return
 
@@ -307,12 +354,15 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         if not theme:
             await inter.response.send_message("Theme is required.", ephemeral=True); return
 
-        entry_end = datetime.now(timezone.utc) + timedelta(hours=eh)
+        entry_end = datetime.now(timezone.utc) + timedelta(seconds=entry_sec)
 
         con = db(); cur = con.cursor()
-        cur.execute("REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, round_index, main_channel_id) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (inter.guild_id, theme, "entry", entry_end.isoformat(), vh, 0, inter.channel_id))
+        cur.execute(
+            "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (inter.guild_id, theme, "entry", entry_end.isoformat(), int(round(vote_sec/3600)), vote_sec, 0, inter.channel_id)
+        )
+
         con.commit(); con.close()
 
         # Post Join embed (channel stays open during entry)
@@ -324,8 +374,9 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             ),
             colour=EMBED_COLOUR
         )
-        join_em.add_field(name="Entries", value=f"Open for **{eh}h**", inline=True)
-        join_em.add_field(name="Voting", value=f"Each round runs **{vh}h**", inline=True)
+        join_em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**", inline=True)
+        join_em.add_field(name="Voting",  value=f"Each round runs **{humanize_seconds(vote_sec)}**",  inline=True)
+
         join_em.set_footer(text="Channel remains open during entries. Voting phase locks main chat.")
 
         view = discord.ui.View(timeout=None)
@@ -499,6 +550,10 @@ async def scheduler():
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if guild else None
             if ch:
+                # use seconds if present; fall back to hours
+                vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+                vote_end = now + timedelta(seconds=vote_sec)
+
                 await ch.send(embed=discord.Embed(
                     title=f"🆚 Stylo — Round {round_index} begins!",
                     description=f"All matches posted. Voting closes in **{ev['vote_hours']}h**.\nMain chat is locked; use each match thread for hype.",
@@ -661,9 +716,14 @@ async def scheduler():
         con.commit()
 
         if ch:
+            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+            vote_end = now + timedelta(seconds=vote_sec)
+
             await ch.send(embed=discord.Embed(
                 title=f"🆚 Stylo — Round {new_round} begins!",
-                description=f"All matches posted. Voting closes in **{ev['vote_hours']}h**.\nMain chat is locked; use each match thread for hype.",
+                description=f"All matches posted. Voting closes in **{humanize_seconds(vote_sec)}**.\n"
+                            f"Main chat is locked; use each match thread for hype.",
+                
                 colour=EMBED_COLOUR
             ))
             default = guild.default_role
