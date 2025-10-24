@@ -234,9 +234,7 @@ def set_log_channel_id(guild_id: int, channel_id: int | None):
 def is_admin(user: discord.Member) -> bool:
     return user.guild_permissions.manage_guild or user.guild_permissions.administrator
 
-
-
-# ---------- Pillow VS card ----------
+# ---------- Pillow VS card (no-crop / letterboxed) ----------
 async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
     async with aiohttp.ClientSession() as sess:
         async with sess.get(left_url) as r1: Lb = await r1.read()
@@ -244,17 +242,37 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
 
     L = Image.open(io.BytesIO(Lb)).convert("RGB")
     R = Image.open(io.BytesIO(Rb)).convert("RGB")
-    target_h = int(width * 3 / 2)  # 2:3 portrait canvas
+
+    # Card geometry
     tile_w = (width - gap) // 2
 
-    def fit(img):
-        return ImageOps.fit(img, (tile_w, target_h), method=Image.LANCZOS, centering=(0.5, 0.5))
-    Lf, Rf = fit(L), fit(R)
+    # 1) Scale *without cropping* so each fits inside tile_w x max_h
+    #    First make temporary contained versions with a generous max height.
+    max_h_guess = int(tile_w * 2.0)  # tall enough so we keep detail
+    Lc = ImageOps.contain(L, (tile_w, max_h_guess), method=Image.LANCZOS)
+    Rc = ImageOps.contain(R, (tile_w, max_h_guess), method=Image.LANCZOS)
 
+    # 2) Use the taller of the two as the final tile height
+    target_h = max(Lc.height, Rc.height)
+
+    # 3) Create pillarbox tiles so images are centered with padding (no crop)
+    def make_tile(img):
+        tile = Image.new("RGB", (tile_w, target_h), (20, 20, 30))  # background
+        x = (tile_w - img.width) // 2
+        y = (target_h - img.height) // 2
+        tile.paste(img, (x, y))
+        return tile
+
+    Ltile = make_tile(Lc)
+    Rtile = make_tile(Rc)
+
+    # 4) Compose final canvas
     canvas = Image.new("RGB", (width, target_h), (20, 20, 30))
-    canvas.paste(Lf, (0, 0))
-    canvas.paste(Rf, (tile_w + gap, 0))
+    canvas.paste(Ltile, (0, 0))
+    canvas.paste(Rtile, (tile_w + gap, 0))
 
+    # 5) Divider
+    from PIL import ImageDraw
     draw = ImageDraw.Draw(canvas)
     x0 = tile_w
     draw.rectangle([x0, 0, x0 + gap, target_h], fill=(45, 45, 60))
@@ -263,6 +281,7 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
     canvas.save(out, format="PNG", optimize=True)
     out.seek(0)
     return out
+
 
 async def update_entry_embed_countdown(message: discord.Message, entry_end: datetime, vote_sec: int):
     """Tick the start embed every ~5s; stop at 00:00 and disable Join."""
@@ -806,11 +825,43 @@ async def on_message(message: discord.Message):
     cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
     con.commit(); con.close()
 
+    # Download a tiny chunk to inspect with PIL
     try:
-        await message.add_reaction("✅")
-        await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used. ")
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(img_url) as r:
+                raw = await r.read()
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw))
+        w, h = im.size
+        long_side = max(w, h)
+        aspect = w / h if h else 1.0
+    
+        # Soft rules (tweak to taste)
+        if long_side < 800:
+            await message.channel.send(
+                f"{message.author.mention} your image is only {w}×{h}. "
+                "Please upload at least **800px on the long side** for better quality."
+            )
+            return
+    
+        # Optional orientation guard (uncomment if you want portrait-only)
+        # if not (0.75 <= (w / h) <= 0.8):
+        #     await message.channel.send(
+        #         f"{message.author.mention} please use a **portrait image** (~3:4 to 4:5). "
+        #         f"Yours is {w}×{h}."
+        #     )
+        #     return
+    
     except Exception:
+        # If we can’t inspect, fall back to accepting it
         pass
+    
+    
+        try:
+            await message.add_reaction("✅")
+            await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used. ")
+        except Exception:
+            pass
 
 
 # ---------- Slash command: /stylo (admin) ----------
@@ -932,7 +983,7 @@ async def scheduler():
                     em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                     em.set_image(url="attachment://versus.png")
                     end_dt = vote_end  # already UTC-aware
-                    em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
+                    #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
 
                     view = MatchView(m["id"], end_dt, L["name"], R["name"])
 
@@ -1096,7 +1147,7 @@ async def scheduler():
                 em.set_image(url="attachment://versus.png")
 
                 end_dt = vote_end  # already timezone-aware UTC
-                em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
+                #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
                 view = MatchView(m["id"], end_dt, L["name"], R["name"])
                 msg = await ch.send(embed=em, view=view, file=file)
 
