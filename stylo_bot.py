@@ -111,10 +111,12 @@ def migrate_db_for_minutes():
         con.commit()
     con.close()
 
+# ---- run DB setup once (order matters; keep this BELOW the function defs) ----
 init_db()
-migrate_db_for_minutes()   # adds vote_seconds
-migrate_db()               # adds ticket_category_id
-migrate_add_start_msg_id() # adds start_msg_id   <-- add this line here
+migrate_db_for_minutes()   # adds event.vote_seconds
+migrate_db()               # adds guild_settings.ticket_category_id (your existing helper)
+migrate_add_start_msg_id() # adds event.start_msg_id
+
 
 
 def migrate_add_start_msg_id():
