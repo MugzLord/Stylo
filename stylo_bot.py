@@ -125,6 +125,14 @@ def rel_ts(dt_utc: datetime) -> str:
     else:
         dt_utc = dt_utc.astimezone(timezone.utc)
     return f"<t:{int(dt_utc.timestamp())}:R>"
+    
+def fmt_hms(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h, r = divmod(seconds, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h:01d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 # ---------- Permissions helper ----------
@@ -168,6 +176,18 @@ def humanize_seconds(sec: int) -> str:
     if m % 60 == 0:
         return f"{m//60}h"
     return f"{m}m"
+
+def build_join_view(enabled: bool = True) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join", disabled=not enabled)
+    async def join_cb(i: discord.Interaction):
+        if i.user.bot:
+            return
+        await i.response.send_modal(EntrantModal(i))
+    btn.callback = join_cb
+    view.add_item(btn)
+    return view
+
 
 # Call after init_db()
 init_db()
@@ -238,6 +258,77 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
     canvas.save(out, format="PNG", optimize=True)
     out.seek(0)
     return out
+
+async def update_entry_embed_countdown(message: discord.Message, entry_end: datetime, vote_sec: int):
+    """Tick the start embed every ~5s; stop at 00:00 and disable Join."""
+    try:
+        # Ensure aware UTC
+        if entry_end.tzinfo is None:
+            entry_end = entry_end.replace(tzinfo=timezone.utc)
+        else:
+            entry_end = entry_end.astimezone(timezone.utc)
+
+        while True:
+            now = datetime.now(timezone.utc)
+            remaining = int((entry_end - now).total_seconds())
+            if remaining < 0:
+                remaining = 0
+
+            if not message.embeds:
+                return
+            em = message.embeds[0]
+
+            # Entries field: show mm:ss (no "ago")
+            def fmt_hms(sec: int) -> str:
+                sec = max(0, sec)
+                h, r = divmod(sec, 3600)
+                m, s = divmod(r, 60)
+                return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+            entries_val = f"Closes in **{fmt_hms(remaining)}**" if remaining > 0 else "**Closed**"
+
+            # Voting preview (after entries end)
+            vote_preview_end = entry_end + timedelta(seconds=vote_sec)
+            voting_val = f"Each round runs **{humanize_seconds(vote_sec)}**\nRound 1 closes {rel_ts(vote_preview_end)}"
+
+            # Ensure the two fields exist, then update
+            if len(em.fields) >= 2:
+                em.set_field_at(0, name="Entries", value=entries_val, inline=True)
+                em.set_field_at(1, name="Voting", value=voting_val, inline=True)
+            else:
+                # normalise to 2 fields
+                if len(em.fields) == 0:
+                    em.add_field(name="Entries", value=entries_val, inline=True)
+                    em.add_field(name="Voting", value=voting_val, inline=True)
+                else:
+                    em.set_field_at(0, name="Entries", value=entries_val, inline=True)
+                    em.add_field(name="Voting", value=voting_val, inline=True)
+
+            # Disable Join when closed
+            if remaining == 0:
+                try:
+                    await message.edit(embed=em, view=build_join_view(enabled=False))
+                except discord.HTTPException:
+                    pass
+                return
+
+            # While open, keep the button enabled
+            try:
+                await message.edit(embed=em, view=build_join_view(enabled=True))
+            except discord.HTTPException:
+                pass
+
+            await asyncio.sleep(5)
+    except Exception:
+        # never crash the bot from a countdown
+        return
+
+
+            await asyncio.sleep(5)  # <- change to 3 if you really want faster
+    except Exception:
+        # never crash the bot from a countdown
+        pass
+
 
 # ---------- Views ----------
 class MatchView(discord.ui.View):
@@ -397,10 +488,12 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 inline=True,
             )
             # Show example voting duration so folks know the cadence
-            vote_preview_end = now_utc + timedelta(seconds=vote_sec)
+            # after you compute: entry_end and vote_sec
+            vote_preview_end = entry_end + timedelta(seconds=vote_sec)   # <-- starts after entries close
             join_em.add_field(
                 name="Voting",
-                value=f"Each round runs **{humanize_seconds(vote_sec)}**\nExample close {rel_ts(vote_preview_end)}",
+                value=f"Each round runs **{humanize_seconds(vote_sec)}**\n"
+                      f"Round 1 closes {rel_ts(vote_preview_end)}",
                 inline=True,
             )
 
@@ -414,9 +507,15 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 await btn_inter.response.send_modal(EntrantModal(btn_inter))
 
             join_btn.callback = join_callback
-            view.add_item(join_btn)
 
+            # use helper so Join button can be toggled later
+            view = build_join_view(enabled=True)
+            
             await inter.response.send_message(embed=join_em, view=view)
+            
+            # get the message we just sent, then start the countdown updater
+            sent = await inter.original_response()
+            asyncio.create_task(update_entry_embed_countdown(sent, entry_end, vote_sec))
 
         except Exception as e:
             import traceback, textwrap, sys
@@ -507,7 +606,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------- Modal: Entrant info (name, caption) ----------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="JasmineMoon", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="YaEli", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -524,10 +623,19 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             # Ensure event is open
             cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
             ev = cur.fetchone()
+            now_utc = datetime.now(timezone.utc)
             if not ev or ev["state"] != "entry":
                 con.close()
                 await inter.response.send_message("Entries are not open.", ephemeral=True)
                 return
+            
+            # NEW: hard stop if entry window already elapsed
+            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+            if now_utc >= entry_end:
+                con.close()
+                await inter.response.send_message("Entries have just closed. Please wait for voting to begin.", ephemeral=True)
+                return
+            
 
             # Upsert entrant
             name = str(self.display_name).strip()
@@ -722,17 +830,34 @@ async def scheduler():
             ch = guild.get_channel(ev["main_channel_id"]) if guild else None
             if ch:
                 # use seconds if present; fall back to hours
+                # BEFORE inserting matches, right after 'if now >= entry_end:'
                 vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
                 vote_end = now + timedelta(seconds=vote_sec)
+                
+                # save matches with correct end_utc
+                for L, R in pairs:
+                    cur.execute(
+                        "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                        (ev["guild_id"], round_index, L["id"], R["id"], vote_end.isoformat())
+                    )
+                con.commit()
+                
+                # Update event cursor to voting and store SAME vote_end in entry_end_utc
+                cur.execute(
+                    "UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
+                    (round_index, vote_end.isoformat(), ev["main_channel_id"], ev["guild_id"])
+                )
+                con.commit()
+                
+                # Announce with the correct countdown
+                if ch:
+                    await ch.send(embed=discord.Embed(
+                        title=f"🆚 Stylo — Round {round_index} begins!",
+                        description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
+                                    "Main chat is locked; use each match thread for hype.",
+                        colour=EMBED_COLOUR
+                    ))
 
-                await ch.send(embed=discord.Embed(
-                    title=f"🆚 Stylo — Round {round_index} begins!",
-                    description=(
-                        f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
-                        "Main chat is locked; use each match thread for hype."
-                    ),
-                    colour=EMBED_COLOUR
-                ))
 
                 # Lock main channel chat
                 default = guild.default_role
