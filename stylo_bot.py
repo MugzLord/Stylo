@@ -113,6 +113,18 @@ def migrate_db_for_minutes():
 
 init_db()
 migrate_db_for_minutes()
+migrate_add_start_msg_id()
+
+
+def migrate_add_start_msg_id():
+    con = db(); cur = con.cursor()
+    cur.execute("PRAGMA table_info(event)")
+    cols = {r["name"] for r in cur.fetchall()}
+    if "start_msg_id" not in cols:
+        cur.execute("ALTER TABLE event ADD COLUMN start_msg_id INTEGER")
+        con.commit()
+    con.close()
+
 
 def rel_ts(dt_utc: datetime) -> str:
     # dt_utc must be timezone-aware UTC
@@ -509,9 +521,23 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             
             await inter.response.send_message(embed=join_em, view=view)
             
-            # get the message we just sent, then start the countdown updater
+            # get the message we just sent
             sent = await inter.original_response()
+            
+            # Pin so it stays at the top during entries
+            try:
+                await sent.pin(reason="Stylo: keep Join visible during entries")
+            except Exception:
+                pass
+            
+            # Store the message id so we can update/unpin later
+            con = db(); cur = con.cursor()
+            cur.execute("UPDATE event SET start_msg_id=? WHERE guild_id=?", (sent.id, inter.guild_id))
+            con.commit(); con.close()
+            
+            # start the countdown updater
             asyncio.create_task(update_entry_embed_countdown(sent, entry_end, vote_sec))
+
 
         except Exception as e:
             import traceback, textwrap, sys
@@ -809,7 +835,9 @@ async def scheduler():
                 byes.append(entrants[-1])
 
             round_index = 1
-            vote_end = now + timedelta(hours=ev["vote_hours"])
+            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+            vote_end = now + timedelta(seconds=vote_sec)
+
             # Save matches
             for L, R in pairs:
                 cur.execute("INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
@@ -820,31 +848,33 @@ async def scheduler():
             cur.execute("UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
                         (round_index, vote_end.isoformat(), ev["main_channel_id"], ev["guild_id"]))
             con.commit()
-
-            # Announce and post all pairs
+            
+            # Resolve channel
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if guild else None
-            if ch:
-                # use seconds if present; fall back to hours
-                # BEFORE inserting matches, right after 'if now >= entry_end:'
-                vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-                vote_end = now + timedelta(seconds=vote_sec)
-                
-                # save matches with correct end_utc
-                for L, R in pairs:
-                    cur.execute(
-                        "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                        (ev["guild_id"], round_index, L["id"], R["id"], vote_end.isoformat())
-                    )
-                con.commit()
-                
-                # Update event cursor to voting and store SAME vote_end in entry_end_utc
-                cur.execute(
-                    "UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
-                    (round_index, vote_end.isoformat(), ev["main_channel_id"], ev["guild_id"])
-                )
-                con.commit()
-                
+            
+            # >>> INSERT THIS BLOCK HERE (after you set ch, before `if ch:`) <<<
+            start_msg_id = ev["start_msg_id"] if ("start_msg_id" in ev.keys()) else None
+            if ch and start_msg_id:
+                try:
+                    start_msg = await ch.fetch_message(start_msg_id)
+                    if start_msg and start_msg.embeds:
+                        em = start_msg.embeds[0]
+                        if em.fields:
+                            em.set_field_at(0, name="Entries", value="**Closed**", inline=True)
+                        try:
+                            # grey the Join button
+                            await start_msg.edit(embed=em, view=build_join_view(enabled=False))
+                        except Exception:
+                            pass
+                    try:
+                        await start_msg.unpin(reason="Stylo: entries closed")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            # <<< END INSERT >>>
+            
                 # Announce with the correct countdown
                 if ch:
                     await ch.send(embed=discord.Embed(
@@ -884,7 +914,7 @@ async def scheduler():
                     em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
 
 
-                    end_dt = datetime.fromisoformat(vote_end.isoformat()).replace(tzinfo=timezone.utc)
+                    end_dt = vote_end  # already UTC-aware
                     view = MatchView(m["id"], end_dt, L["name"], R["name"])
 
                     msg = await ch.send(embed=em, view=view, file=file)
@@ -1019,7 +1049,7 @@ async def scheduler():
 
             await ch.send(embed=discord.Embed(
                 title=f"🆚 Stylo — Round {new_round} begins!",
-                description=f"All matches posted. Voting closes in **{humanize_seconds(vote_sec)}**.\n"
+                description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
                             f"Main chat is locked; use each match thread for hype.",
                 
                 colour=EMBED_COLOUR
@@ -1047,7 +1077,7 @@ async def scheduler():
                 em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                 em.set_image(url="attachment://versus.png")
 
-                end_dt = datetime.fromisoformat(vote_end.isoformat()).replace(tzinfo=timezone.utc)
+                end_dt = vote_end  # already timezone-aware UTC
                 view = MatchView(m["id"], end_dt, L["name"], R["name"])
                 msg = await ch.send(embed=em, view=view, file=file)
 
