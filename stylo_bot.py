@@ -863,12 +863,18 @@ async def on_message(message: discord.Message):
     cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
     con.commit(); con.close()
 
-       
-        try:
-            await message.add_reaction("✅")
-            await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used. ")
-        except Exception:
-            pass
+    # (still inside on_message, same indent level as the DB update)
+    try:
+        await message.add_reaction("✅")
+    except Exception:
+        pass
+    
+    try:
+        await message.channel.send(
+            f"Saved your entry, {message.author.mention}! Your latest image will be used."
+        )
+    except Exception:
+        pass
 
 
 # ---------- Slash command: /stylo (admin) ----------
