@@ -262,11 +262,17 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
 async def update_entry_embed_countdown(message: discord.Message, entry_end: datetime, vote_sec: int):
     """Tick the start embed every ~5s; stop at 00:00 and disable Join."""
     try:
-        # Ensure aware UTC
+        # ensure aware UTC
         if entry_end.tzinfo is None:
             entry_end = entry_end.replace(tzinfo=timezone.utc)
         else:
             entry_end = entry_end.astimezone(timezone.utc)
+
+        def fmt_hms(sec: int) -> str:
+            sec = max(0, int(sec))
+            h, r = divmod(sec, 3600)
+            m, s = divmod(r, 60)
+            return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
         while True:
             now = datetime.now(timezone.utc)
@@ -278,25 +284,21 @@ async def update_entry_embed_countdown(message: discord.Message, entry_end: date
                 return
             em = message.embeds[0]
 
-            # Entries field: show mm:ss (no "ago")
-            def fmt_hms(sec: int) -> str:
-                sec = max(0, sec)
-                h, r = divmod(sec, 3600)
-                m, s = divmod(r, 60)
-                return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
+            # Entries (mm:ss), never show "ago"
             entries_val = f"Closes in **{fmt_hms(remaining)}**" if remaining > 0 else "**Closed**"
 
-            # Voting preview (after entries end)
+            # Voting preview starts AFTER entries end
             vote_preview_end = entry_end + timedelta(seconds=vote_sec)
-            voting_val = f"Each round runs **{humanize_seconds(vote_sec)}**\nRound 1 closes {rel_ts(vote_preview_end)}"
+            voting_val = (
+                f"Each round runs **{humanize_seconds(vote_sec)}**\n"
+                f"Round 1 closes {rel_ts(vote_preview_end)}"
+            )
 
-            # Ensure the two fields exist, then update
+            # Ensure two fields exist and update them
             if len(em.fields) >= 2:
                 em.set_field_at(0, name="Entries", value=entries_val, inline=True)
                 em.set_field_at(1, name="Voting", value=voting_val, inline=True)
             else:
-                # normalise to 2 fields
                 if len(em.fields) == 0:
                     em.add_field(name="Entries", value=entries_val, inline=True)
                     em.add_field(name="Voting", value=voting_val, inline=True)
@@ -304,31 +306,25 @@ async def update_entry_embed_countdown(message: discord.Message, entry_end: date
                     em.set_field_at(0, name="Entries", value=entries_val, inline=True)
                     em.add_field(name="Voting", value=voting_val, inline=True)
 
-            # Disable Join when closed
             if remaining == 0:
+                # final edit: disable Join, then stop
                 try:
                     await message.edit(embed=em, view=build_join_view(enabled=False))
                 except discord.HTTPException:
                     pass
                 return
 
-            # While open, keep the button enabled
+            # still open: keep Join enabled and tick again
             try:
                 await message.edit(embed=em, view=build_join_view(enabled=True))
             except discord.HTTPException:
                 pass
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)  # safe cadence; use 3s if you want faster
+
     except Exception:
         # never crash the bot from a countdown
         return
-
-
-            await asyncio.sleep(5)  # <- change to 3 if you really want faster
-    except Exception:
-        # never crash the bot from a countdown
-        pass
-
 
 # ---------- Views ----------
 class MatchView(discord.ui.View):
