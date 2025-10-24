@@ -669,6 +669,25 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             cur.execute("SELECT id FROM entrant WHERE guild_id=? AND user_id=?", (inter.guild_id, inter.user.id))
             entrant_id = cur.fetchone()["id"]
 
+            # --- prevent duplicate ticket channels for this entrant ---
+            cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
+            existing = cur.fetchone()
+            if existing:
+                # If the saved channel still exists, just point the user to it and stop here.
+                already = inter.guild.get_channel(existing["channel_id"])
+                if already:
+                    con.close()
+                    await inter.response.send_message(
+                        f"You already have a ticket: {already.mention}", ephemeral=True
+                    )
+                    return
+                else:
+                    # Channel no longer exists but the DB row is still there -> cleanup the row
+                    cur.execute("DELETE FROM ticket WHERE entrant_id=?", (entrant_id,))
+                    con.commit()
+            # --- end duplicate guard ---
+            
+
             guild = inter.guild
 
             # Resolve category (optional) and validate perms/limits
@@ -813,6 +832,8 @@ async def scheduler():
             # Build entrant list with images
             cur.execute("SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL", (ev["guild_id"],))
             entrants = cur.fetchall()
+            print(f"[stylo] entry->voting: entrants with image = {len(entrants)} (guild {ev['guild_id']})")
+
             if len(entrants) < 2:
                 # Not enough entrants; close
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
@@ -844,7 +865,13 @@ async def scheduler():
             # Resolve channel
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if guild else None
-            
+
+            print(f"[stylo] posting to channel: {ev['main_channel_id']} resolved={bool(ch)}")
+            # Fallback: if the original channel can’t be resolved, try the guild’s system channel
+            if not ch and guild and guild.system_channel:
+                ch = guild.system_channel
+                print(f"[stylo] fallback to system_channel id={ch.id}")
+
             # >>> INSERT THIS BLOCK HERE (after you set ch, before `if ch:`) <<<
             start_msg_id = ev["start_msg_id"] if ("start_msg_id" in ev.keys()) else None
             if ch and start_msg_id:
