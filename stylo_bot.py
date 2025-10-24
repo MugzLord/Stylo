@@ -1,12 +1,3 @@
-# stylo_bot.py  —  "Stylo" (Fit-Wars style fashion bracket)
-# Features:
-# - /stylo (admin only) opens a modal (Theme, Entry Hours, Vote Hours)
-# - Join button -> entrant modal (name, caption) -> private ticket channel for image upload
-# - After entry window ends: random pairing, posts ALL matches at once with side-by-side VS cards
-# - One vote per user per match, anonymous live split; buttons in main channel, chat locked there
-# - Auto thread per match for supporters' chat; threads lock on round end
-# - SQLite persistence (restart safe)
-
 import os, io, math, asyncio, random, sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -83,6 +74,11 @@ def init_db():
             FOREIGN KEY(left_id)  REFERENCES entrant(id),
             FOREIGN KEY(right_id) REFERENCES entrant(id)
         );
+        
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id       INTEGER PRIMARY KEY,
+            log_channel_id INTEGER
+        );
 
         CREATE TABLE IF NOT EXISTS voter (
             match_id     INTEGER NOT NULL,
@@ -98,6 +94,23 @@ def init_db():
 init_db()
 
 # ---------- Permissions helper ----------
+def get_log_channel_id(guild_id: int) -> int | None:
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone()
+    con.close()
+    return row["log_channel_id"] if row and row["log_channel_id"] else None
+
+def set_log_channel_id(guild_id: int, channel_id: int | None):
+    con = db(); cur = con.cursor()
+    if channel_id is None:
+        cur.execute("DELETE FROM guild_settings WHERE guild_id=?", (guild_id,))
+    else:
+        cur.execute("INSERT INTO guild_settings(guild_id, log_channel_id) VALUES(?,?) "
+                    "ON CONFLICT(guild_id) DO UPDATE SET log_channel_id=excluded.log_channel_id",
+                    (guild_id, channel_id))
+    con.commit(); con.close()
+
 def is_admin(user: discord.Member) -> bool:
     return user.guild_permissions.manage_guild or user.guild_permissions.administrator
 
@@ -201,6 +214,32 @@ class MatchView(discord.ui.View):
         for c in self.children:
             if isinstance(c, discord.ui.Button):
                 c.disabled = True
+
+
+# ---------------- Per-guild settings: /stylo_settings ----------------
+settings_group = app_commands.Group(name="stylo_settings", description="Configure Stylo per server")
+
+@settings_group.command(name="set_log_channel", description="Set the channel where Stylo posts status updates.")
+@app_commands.describe(channel="Pick a text channel (use a private logs channel if you prefer).")
+async def stylo_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    set_log_channel_id(inter.guild_id, channel.id)
+    await inter.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+
+@settings_group.command(name="show", description="Show current Stylo settings for this server.")
+async def stylo_show_settings(inter: discord.Interaction):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    ch_id = get_log_channel_id(inter.guild_id)
+    mention = f"<#{ch_id}>" if ch_id else "— not set —"
+    em = discord.Embed(title="Stylo Settings", colour=EMBED_COLOUR)
+    em.add_field(name="Log channel", value=mention, inline=False)
+    await inter.response.send_message(embed=em, ephemeral=True)
+
+# Register the group
+bot.tree.add_command(settings_group)
+
 
 # ---------- Modal: Admin start ----------
 class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
@@ -627,6 +666,19 @@ async def scheduler():
 @scheduler.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
+
+import os
+
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+
+@bot.event
+async def on_ready():
+    ...
+    if LOG_CHANNEL_ID:
+        channel = bot.get_channel(LOG_CHANNEL_ID)
+        if channel:
+            await channel.send("✨ Stylo updated to the latest version and is back online!")
+
 
 # ---------- Ready ----------
 @bot.event
