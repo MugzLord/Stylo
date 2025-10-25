@@ -1032,18 +1032,38 @@ async def scheduler():
                         # Try to compose the side-by-side image; fall back gracefully
                         file = None
                         fallback_img_url = L["image_url"] or R["image_url"]
+                        
                         try:
                             card = await build_vs_card(L["image_url"], R["image_url"])
                             file = discord.File(fp=card, filename="versus.png")
+                            em = discord.Embed(
+                                title=f"Round {round_index} — {L['name']} vs {R['name']}",
+                                description="Tap a button to vote. One vote per person.",
+                                colour=EMBED_COLOUR
+                            )
+                            em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                        
+                            # IMPORTANT: show the attached image in the embed
+                            em.set_image(url="attachment://versus.png")
+                        
+                            view = MatchView(m["id"], vote_end, L["name"], R["name"])
+                            msg = await ch.send(embed=em, view=view, file=file)
+                        
                         except Exception:
-                            file = None  # we’ll just show one image via URL in the embed
-                
-                        em = discord.Embed(
-                            title=f"Round {round_index} — {L['name']} vs {R['name']}",
-                            description="Tap a button to vote. One vote per person.",
-                            colour=EMBED_COLOUR
-                        )
-                        em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                            # Composition failed – show at least one participant’s image as a banner
+                            em = discord.Embed(
+                                title=f"Round {round_index} — {L['name']} vs {R['name']}",
+                                description="Tap a button to vote. One vote per person.",
+                                colour=EMBED_COLOUR
+                            )
+                            em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                        
+                            if fallback_img_url:
+                                em.set_image(url=fallback_img_url)
+                        
+                            view = MatchView(m["id"], vote_end, L["name"], R["name"])
+                            msg = await ch.send(embed=em, view=view)
+
                 
                         # If compose failed, at least show one image as the banner
                         if not file and fallback_img_url:
@@ -1351,7 +1371,6 @@ async def scheduler():
         
             await ch.send(embed=em)
   
-        # Otherwise set up next round
         # Build next entrants from winners (must have images already)
         placeholders = ",".join("?" for _ in winners)
         cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winners)
@@ -1366,9 +1385,10 @@ async def scheduler():
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
         vote_end = now + timedelta(seconds=vote_sec)
         
+        # Save matches
         for L, R in pairs:
             cur.execute("INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                        (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat()))
+                        (ev["guild_id"], round_index, L["id"], R["id"], vote_end.isoformat()))
         con.commit()
         
         # Keep the event cursor’s end time in the same field (used as the round end)
