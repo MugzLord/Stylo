@@ -1152,9 +1152,9 @@ async def scheduler():
                         description=(
                             f"**{LN}**: {L} ({pL}%)\n"
                             f"**{RN}**: {R} ({pR}%)\n\n"
-                            f"{confetti}\n"
+                        
                             f"**Winner:** {winner_user.mention if winner_user else winner_display} 🎉\n"
-                            f"{confetti}"
+                       
                         ),
                         colour=discord.Colour.green()
                     )
@@ -1276,17 +1276,18 @@ async def scheduler():
                 description=f"Winner by public vote: **{champ_display}**",
                 colour=discord.Colour.gold()
             )
-            # Winner photo as thumbnail (small); confetti GIF as the big image
+            # Winner photo big
             if champ_img:
-                em.set_thumbnail(url=champ_img)
+                em.set_image(url=champ_img)
             
+            # Confetti as thumbnail (may not animate)
             try:
                 file = discord.File(CONFETTI_GIF_PATH, filename="confetti.gif")
-                em.set_image(url="attachment://confetti.gif")
+                em.set_thumbnail(url="attachment://confetti.gif")
                 await ch.send(embed=em, file=file)
             except Exception:
-                # If the file is missing/too large, still send the embed
                 await ch.send(embed=em)
+
 
         # Otherwise set up next round
         # Build next entrants from winners (must have images already)
