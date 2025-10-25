@@ -792,9 +792,9 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                 description=(
                     "Please upload **one** image for your entry in this channel.\n"
                     "• **Must be square (1:1)**\n"
-                    "• **At least 800px** on the long side\n"
                     "You may re-upload to replace it - the **last** image before entries close is used.\n"
                     "If you’re unsure, feel free to ask an Admin for guidance."
+                    "⚠️ This channel will vanish into the IMVU void after the event ends."
                 ),
                 colour=EMBED_COLOUR
             )
@@ -1039,49 +1039,31 @@ async def scheduler():
         any_revote = False  # track if at least one match needs a tiebreak re-vote
 
         for m in matches:
-            # Disable buttons, lock thread
-            if ch and m["msg_id"]:
-                try:
-                    msg = await ch.fetch_message(m["msg_id"])
-                    # Disable view (create disabled view)
-                    if msg.components:
-                        view = MatchView(m["id"], now - timedelta(seconds=1), "Left", "Right")
-                        for c in view.children:
-                            if isinstance(c, discord.ui.Button):
-                                c.disabled = True
-                        await msg.edit(view=view)
-                except Exception:
-                    pass
-            if guild and m["thread_id"]:
-                try:
-                    thread = await guild.fetch_channel(m["thread_id"])
-                    await thread.edit(locked=True, archived=True)
+           
                 except Exception:
                     pass
 
             # Compute winner
             L = m["left_votes"]; R = m["right_votes"]
 
-            # Fetch names once (needed for either path)
+            # Fetch names (used in both paths)
             cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LN = cur.fetchone()["name"]
             cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); RN = cur.fetchone()["name"]
             
             if L == R:
-                # --- TIE: automatically reopen this match for a re-vote of the same duration ---
                 any_revote = True
                 new_end = now + timedelta(seconds=vote_sec)
             
-                # Reset this match's votes and deadline; clear previous voters
+                # Reset votes/deadline and clear prior voters
                 cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
                             (new_end.isoformat(), m["id"]))
                 cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
                 con.commit()
             
-                # Re-enable buttons & reset the embed on the original message
+                # Re-enable buttons and reset embed totals on original message
                 if ch and m["msg_id"]:
                     try:
                         msg = await ch.fetch_message(m["msg_id"])
-                        # rebuild "Live totals" field
                         if msg.embeds:
                             em = msg.embeds[0]
                             if em.fields:
@@ -1093,7 +1075,7 @@ async def scheduler():
                                              value="Total votes: **0**\nSplit: **0% / 0%**",
                                              inline=False)
                             em.set_footer(text=f"Voting ends {rel_ts(new_end)}")
-                            view = MatchView(m["id"], new_end, LN, RN)  # re-enable buttons
+                            view = MatchView(m["id"], new_end, LN, RN)  # re-enabled buttons
                             await msg.edit(embed=em, view=view)
                     except Exception:
                         pass
@@ -1106,14 +1088,55 @@ async def scheduler():
                     except Exception:
                         pass
             
-                # Announce the tie / revote
+                # Announce tie / re-vote
                 if ch:
                     try:
                         await ch.send(embed=discord.Embed(
                             title=f"🔁 Tie-break — {LN} vs {RN}",
-                            description=f"Tied at {L}–{R}. Re-vote is open **now** and closes {rel_ts(new_end)}.",
+                            description=f"Tied at {L}–{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
                             colour=discord.Colour.orange()
                         ))
+                    except Exception:
+                        pass
+            
+                continue  # skip winner handling; go to next match
+            
+            # ----- Normal (non-tie) path -----
+            winner_id = m["left_id"] if L > R else m["right_id"]
+            cur.execute("UPDATE match SET winner_id=? WHERE id=?", (winner_id, m["id"]))
+            con.commit()
+            winners.append(winner_id)
+            
+            # NOW disable buttons & lock thread (only for non-ties)
+            if ch and m["msg_id"]:
+                try:
+                    msg = await ch.fetch_message(m["msg_id"])
+                    view = MatchView(m["id"], now - timedelta(seconds=1), LN, RN)
+                    for c in view.children:
+                        if isinstance(c, discord.ui.Button):
+                            c.disabled = True
+                    await msg.edit(view=view)
+                except Exception:
+                    pass
+            if guild and m["thread_id"]:
+                try:
+                    thread = await guild.fetch_channel(m["thread_id"])
+                    await thread.edit(locked=True, archived=True)
+                except Exception:
+                    pass
+            
+            # Post result
+            total = L + R
+            pL = round((L / total) * 100, 1) if total else 0.0
+            pR = round((R / total) * 100, 1) if total else 0.0
+            if ch:
+                await ch.send(embed=discord.Embed(
+                    title=f"🏁 Result — {LN} vs {RN}",
+                    description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n**Winner:** "
+                                f"**{LN if winner_id==m['left_id'] else RN}**",
+                    colour=discord.Colour.green()
+                ))
+
                     except Exception:
                         pass
             
