@@ -1128,47 +1128,33 @@ async def scheduler():
         
             if ch:
                 try:
-                    # --- Winner image + confetti setup ---
-                    winner_user = guild.get_member(
-                        (await bot.fetch_user(ev["guild_id"])) if False else 0
-                    )  # placeholder; we'll fetch below
-        
-                    winner_entry = None
-                    if winner_id == m["left_id"]:
-                        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["left_id"],))
-                        winner_entry = cur.fetchone()
-                    else:
-                        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["right_id"],))
-                        winner_entry = cur.fetchone()
-        
-                    winner_img = winner_entry["image_url"] if winner_entry and winner_entry["image_url"] else None
-                    winner_user = guild.get_member(winner_entry["user_id"]) if winner_entry else None
-                    winner_display = winner_user.display_name if winner_user else winner_entry["name"]
-        
-                    confetti = "🎊🎉✨💥🎈"
-
+                    # winner image + @mention (simple + safe)
+                    cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (winner_id,))
+                    row = cur.fetchone()
+            
+                    win_name = row["name"] if row else (LN if winner_id == m["left_id"] else RN)
+                    win_img  = row["image_url"] if row and row["image_url"] else None
+                    member   = guild.get_member(row["user_id"]) if row else None
+                    win_display = member.mention if member else win_name
+            
                     em = discord.Embed(
                         title=f"🏁 Result — {LN} vs {RN}",
                         description=(
                             f"**{LN}**: {L} ({pL}%)\n"
                             f"**{RN}**: {R} ({pR}%)\n\n"
-                        
-                            f"**Winner:** {winner_user.mention if winner_user else winner_display} 🎉\n"
-                       
+                            f"**Winner:** {win_display}"
                         ),
                         colour=discord.Colour.green()
                     )
-                    
-                    if winner_img:
-                        em.set_image(url=winner_img)
-                    
+                    if win_img:
+                        em.set_image(url=win_img)
+            
                     await ch.send(embed=em)
 
 
                 except Exception:
                     pass
-        
-                    
+ 
                 continue  # skip winner handling; go to next match
 
            
@@ -1248,8 +1234,6 @@ async def scheduler():
             # wait for the re-votes to finish; do not unlock or start a new round
             continue
         # --- END PATCH ---
-
-
         # Unlock main channel after round
         if ch:
             default = guild.default_role
@@ -1259,7 +1243,6 @@ async def scheduler():
                 pass
 
         # Announce champion (with image + @mention + confetti)
-        # winners[0] might be an ID or a tuple — handle both
         champion_id = winners[0][1] if isinstance(winners[0], (list, tuple)) else winners[0]
     
         # Get champion record
@@ -1271,20 +1254,20 @@ async def scheduler():
         champ_display = champ_user.mention if champ_user else champ_name
     
         if ch:
+            # --- Stylo Champion Embed (final clean version) ---
             em = discord.Embed(
-                title=f"👑 Stylo Champion — {ev['theme']}",
-                description=f"Winner by public vote: **{champ_display}**",
+                title=f"👑 Stylo Champion — {event_name}",
                 colour=discord.Colour.gold()
             )
-            # Winner photo big
-            if champ_img:
-                em.set_image(url=champ_img)
             
-            # Confetti as thumbnail (may not animate)
-            try:
-                file = discord.File(CONFETTI_GIF_PATH, filename="confetti.gif")
-                em.set_thumbnail(url="attachment://confetti.gif")
-                await ch.send(embed=em, file=file)
+            # Winner's image as large banner
+            em.set_image(url=winner_img_url)
+            
+            # Footer text below image (not clickable)
+            em.set_footer(text=f"Winner by public vote: {winner_member.display_name}")
+            
+            await channel.send(embed=em)
+
             except Exception:
                 await ch.send(embed=em)
 
@@ -1327,7 +1310,6 @@ async def scheduler():
                             f"Main chat is locked; use each match thread for hype.",
                 colour=EMBED_COLOUR
             ))
-
             
             default = guild.default_role
             try:
