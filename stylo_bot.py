@@ -793,8 +793,8 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                     "Please upload **one** image for your entry in this channel.\n"
                     "• **Must be square (1:1)**\n"
                     "You may re-upload to replace it - the **last** image before entries close is used.\n"
-                    "If you’re unsure, feel free to ask an Admin for guidance."
-                    "⚠️ This channel will vanish into the IMVU void after the event ends."
+                    "If you’re unsure, feel free to ask an Admin for guidance.\n"
+                    "⚠️ This channel will vanish into the IMVU void when the voting starts."
                 ),
                 colour=EMBED_COLOUR
             )
@@ -1066,8 +1066,25 @@ async def scheduler():
                 # Re-enable buttons / reset message (if you edit the original post)
                 if ch and m["msg_id"]:
                     try:
-                        # TODO: your message edit code here (re-enable buttons, reset totals on embed)
-                        pass
+                        msg = await ch.fetch_message(m["msg_id"])
+                        em = msg.embeds[0] if msg.embeds else discord.Embed(
+                            title=f"Round {ev['round_index']} — {LN} vs {RN}",
+                            description="Tap a button to vote. One vote per person.",
+                            colour=EMBED_COLOUR
+                        )
+                        # reset the live totals field
+                        if em.fields:
+                            em.set_field_at(0, name="Live totals",
+                                            value="Total votes: **0**\nSplit: **0% / 0%**",
+                                            inline=False)
+                        else:
+                            em.add_field(name="Live totals",
+                                         value="Total votes: **0**\nSplit: **0% / 0%**",
+                                         inline=False)
+                
+                        view = MatchView(m["id"], new_end, LN, RN)  # new_end is already set above
+                        await msg.edit(embed=em, view=view)
+
                     except Exception:
                         pass
         
@@ -1197,7 +1214,6 @@ async def scheduler():
             # wait for the re-votes to finish; do not unlock or start a new round
             continue
         # --- END PATCH ---
-
 
 
         # Unlock main channel after round
