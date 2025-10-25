@@ -41,12 +41,11 @@ EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)  # neon pink/purple vibe
 class StyloBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=commands.when_mentioned_or("!"), intents=INTENTS)
-        self.tree = app_commands.CommandTree(self)
-        self.session: Optional[aiohttp.ClientSession] = None
-
-    async def setup_hook(self):
+                self.session: Optional[aiohttp.ClientSession] = None    async def setup_hook(self):
+        # Bot already has a default app command tree; just sync it.
         await self.tree.sync()
-        scheduler.start()
+        if not scheduler.is_running():
+            scheduler.start()
 
 bot = StyloBot()
 
