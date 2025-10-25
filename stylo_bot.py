@@ -1018,24 +1018,7 @@ async def scheduler():
             # done entry->voting
     con.close()
     
-        # --- PATCH: stop advancing if any re-vote (tiebreak) was opened ---
-        if any_revote:
-            # Keep the event in the same round; push its end to the latest match end
-            cur.execute(
-                "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
-                (ev["guild_id"], ev["round_index"])
-            )
-            mx = cur.fetchone()["mx"]
-            if mx:
-                cur.execute(
-                    "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
-                    (mx, ev["guild_id"])
-                )
-                con.commit()
-            # Do NOT unlock main chat; do NOT announce a new round; wait for re-votes to finish.
-            continue
-        # --- END PATCH ---
-
+        
 
     # Handle voting end -> compute winners; maybe next round
     con = db(); cur = con.cursor()
@@ -1197,6 +1180,24 @@ async def scheduler():
                                 f"**{LN if winner_id==m['left_id'] else RN}**",
                     colour=discord.Colour.green()
                 ))
+
+        # --- PATCH: stop advancing if any re-vote (tiebreak) was opened ---
+        if any_revote:
+            cur.execute(
+                "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                (ev["guild_id"], ev["round_index"])
+            )
+            mx = cur.fetchone()["mx"]
+            if mx:
+                cur.execute(
+                    "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                    (mx, ev["guild_id"])
+                )
+                con.commit()
+            # wait for the re-votes to finish; do not unlock or start a new round
+            continue
+        # --- END PATCH ---
+
 
 
         # Unlock main channel after round
