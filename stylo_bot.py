@@ -1010,7 +1010,8 @@ async def scheduler():
 
                     card = await build_vs_card(L["image_url"], R["image_url"])
                     file = discord.File(fp=card, filename="versus.png")
-
+                    file.spoiler = True          # ← add this line
+                    
                     em = discord.Embed(
                         title=f"Round {round_index} — {L['name']} vs {R['name']}",
                         description="Tap a button to vote. One vote per person.",
@@ -1018,9 +1019,9 @@ async def scheduler():
                     )
                     em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                     em.set_image(url="attachment://versus.png")
-
-                    view = MatchView(m["id"], vote_end, L["name"], R["name"])
+                    
                     msg = await ch.send(embed=em, view=view, file=file)
+                    
 
                     # Supporter thread
                     try:
