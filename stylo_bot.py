@@ -651,21 +651,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
             con.commit(); con.close()
 
-            info = discord.Embed(
-                title="📸 Submit your outfit image",
-                description=(
-                    "Please upload **one** image for your entry in this channel.\n"
-                    "• **Must be square (1:1)**\n"
-                    "• **At least 800px** on the long side\n"
-                    "You may re-upload to replace it - the **last** image before entries close is used.\n"
-                    "If you’re unsure, feel free to ask an Admin for guidance."
-                ),
-                colour=EMBED_COLOUR
-            )
-
-            await ticket.send(content=inter.user.mention, embed=info)
-            await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
-
+            
         except Exception as e:
             import traceback, textwrap, sys
             traceback.print_exc(file=sys.stderr)
@@ -805,11 +791,14 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                 title="📸 Submit your outfit image",
                 description=(
                     "Please upload **one** image for your entry in this channel.\n"
-                    "You may re-upload to replace it — the **last** image before entries close is used.\n"
-                    "Spam or unrelated messages may be removed."
+                    "• **Must be square (1:1)**\n"
+                    "• **At least 800px** on the long side\n"
+                    "You may re-upload to replace it - the **last** image before entries close is used.\n"
+                    "If you’re unsure, feel free to ask an Admin for guidance."
                 ),
                 colour=EMBED_COLOUR
             )
+
             await ticket.send(content=inter.user.mention, embed=info)
             await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
 
@@ -1045,6 +1034,10 @@ async def scheduler():
                     (ev["guild_id"], ev["round_index"]))
         matches = cur.fetchall()
         winners = []
+        # use seconds for per-round duration
+        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+        any_revote = False  # track if at least one match needs a tiebreak re-vote
+
         for m in matches:
             # Disable buttons, lock thread
             if ch and m["msg_id"]:
@@ -1068,14 +1061,72 @@ async def scheduler():
 
             # Compute winner
             L = m["left_votes"]; R = m["right_votes"]
-            winner_id = m["left_id"] if L > R else m["right_id"] if R > L else random.choice([m["left_id"], m["right_id"]])
+
+            # Fetch names once (needed for either path)
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LN = cur.fetchone()["name"]
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); RN = cur.fetchone()["name"]
+            
+            if L == R:
+                # --- TIE: automatically reopen this match for a re-vote of the same duration ---
+                any_revote = True
+                new_end = now + timedelta(seconds=vote_sec)
+            
+                # Reset this match's votes and deadline; clear previous voters
+                cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                            (new_end.isoformat(), m["id"]))
+                cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
+                con.commit()
+            
+                # Re-enable buttons & reset the embed on the original message
+                if ch and m["msg_id"]:
+                    try:
+                        msg = await ch.fetch_message(m["msg_id"])
+                        # rebuild "Live totals" field
+                        if msg.embeds:
+                            em = msg.embeds[0]
+                            if em.fields:
+                                em.set_field_at(0, name="Live totals",
+                                                value="Total votes: **0**\nSplit: **0% / 0%**",
+                                                inline=False)
+                            else:
+                                em.add_field(name="Live totals",
+                                             value="Total votes: **0**\nSplit: **0% / 0%**",
+                                             inline=False)
+                            em.set_footer(text=f"Voting ends {rel_ts(new_end)}")
+                            view = MatchView(m["id"], new_end, LN, RN)  # re-enable buttons
+                            await msg.edit(embed=em, view=view)
+                    except Exception:
+                        pass
+            
+                # Re-open the thread if we had just locked it
+                if guild and m["thread_id"]:
+                    try:
+                        thread = await guild.fetch_channel(m["thread_id"])
+                        await thread.edit(locked=False, archived=False)
+                    except Exception:
+                        pass
+            
+                # Announce the tie / revote
+                if ch:
+                    try:
+                        await ch.send(embed=discord.Embed(
+                            title=f"🔁 Tie-break — {LN} vs {RN}",
+                            description=f"Tied at {L}–{R}. Re-vote is open **now** and closes {rel_ts(new_end)}.",
+                            colour=discord.Colour.orange()
+                        ))
+                    except Exception:
+                        pass
+            
+                # Skip winner handling for this match
+                continue
+            
+            # --- Normal non-tie winner path ---
+            winner_id = m["left_id"] if L > R else m["right_id"]
             cur.execute("UPDATE match SET winner_id=? WHERE id=?", (winner_id, m["id"]))
             con.commit()
             winners.append(winner_id)
-
+            
             # Post result
-            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LN = cur.fetchone()["name"]
-            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); RN = cur.fetchone()["name"]
             total = L + R
             pL = round((L / total) * 100, 1) if total else 0.0
             pR = round((R / total) * 100, 1) if total else 0.0
@@ -1086,6 +1137,7 @@ async def scheduler():
                                 f"**{LN if winner_id==m['left_id'] else RN}**",
                     colour=discord.Colour.green()
                 ))
+
 
         # Unlock main channel after round
         if ch:
@@ -1159,6 +1211,18 @@ async def scheduler():
                         (ev["guild_id"], new_round))
             matches = cur.fetchall()
             for m in matches:
+                if any_revote:
+                    # Keep event in 'voting' and push its round end to the latest match end.
+                    cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                                (ev["guild_id"], ev["round_index"]))
+                    mx = cur.fetchone()["mx"]
+                    if mx:
+                        cur.execute("UPDATE event SET entry_end_utc=? WHERE guild_id=?",
+                                    (mx, ev["guild_id"]))
+                        con.commit()
+                    # Don't unlock main chat or advance rounds; wait for tie re-votes to finish
+                    continue
+
                 cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                 cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
                 card = await build_vs_card(L["image_url"], R["image_url"])
