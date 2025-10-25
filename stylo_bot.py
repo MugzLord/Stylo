@@ -1622,7 +1622,22 @@ async def stylo_debug(inter: discord.Interaction):
         msg += "ℹ️ Status looks consistent."
 
     await inter.response.send_message(msg, ephemeral=True)
-#end of the error debugger
+
+@bot.tree.command(name="stylo_reset", description="⚠️ Admin only — reset Stylo event and matches for testing.")
+async def stylo_reset(inter: discord.Interaction):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True)
+        return
+
+    con = db(); cur = con.cursor()
+    cur.execute("DELETE FROM match")
+    cur.execute("DELETE FROM event")
+    cur.execute("DELETE FROM entrant")
+    cur.execute("DELETE FROM ticket")
+    cur.execute("DELETE FROM voter")
+    con.commit(); con.close()
+
+    await inter.response.send_message("🧹 Stylo database reset complete. You can now run `/stylo` fresh.", ephemeral=True)
 
 # ---------- Ready ----------
 @bot.event
