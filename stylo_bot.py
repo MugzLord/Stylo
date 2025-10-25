@@ -1393,6 +1393,56 @@ async def stylo_show_ticket_category(inter: discord.Interaction):
     em.add_field(name="Ticket Category", value=mention, inline=False)
     await inter.response.send_message(embed=em, ephemeral=True)
 
+#added to see what's making pair error
+@bot.tree.command(name="stylo_debug", description="Show Stylo status for this server (admin only).")
+async def stylo_debug(inter: discord.Interaction):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
+    ev = cur.fetchone()
+
+    if not ev:
+        con.close()
+        await inter.response.send_message("No active event found.", ephemeral=True)
+        return
+
+    # Counts
+    cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (inter.guild_id,))
+    total_entrants = cur.fetchone()["c"] or 0
+    cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=? AND image_url IS NOT NULL", (inter.guild_id,))
+    with_image = cur.fetchone()["c"] or 0
+    cur.execute("SELECT COUNT(*) AS c FROM match WHERE guild_id=? AND round_index=?", (inter.guild_id, ev["round_index"]))
+    matches_in_round = cur.fetchone()["c"] or 0
+
+    # Times
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+
+    con.close()
+
+    msg = (
+        f"**Event state:** `{ev['state']}`  |  **Round:** `{ev['round_index']}`\n"
+        f"**Entrants (total):** {total_entrants}\n"
+        f"**Entrants with image:** {with_image}\n"
+        f"**Matches in this round:** {matches_in_round}\n"
+        f"**Entry end (UTC):** {entry_end.isoformat()}  |  **Now:** {now.isoformat()}\n\n"
+    )
+
+    # Simple diagnosis
+    if ev["state"] == "entry" and with_image >= 2 and now >= entry_end:
+        msg += "➡️ Entries ended and there are at least 2 images. Scheduler should create pairs on its next tick."
+    elif ev["state"] == "entry" and with_image < 2 and now >= entry_end:
+        msg += "⛔ Entries ended but fewer than 2 images were saved — no pairs can be created."
+    elif ev["state"] == "voting" and matches_in_round == 0:
+        msg += "⚠️ State is 'voting' but no matches exist; something blocked pair creation."
+    else:
+        msg += "ℹ️ Status looks consistent."
+
+    await inter.response.send_message(msg, ephemeral=True)
+#end of the error debugger
 
 # ---------- Ready ----------
 @bot.event
