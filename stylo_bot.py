@@ -1266,10 +1266,14 @@ async def scheduler():
             # Footer text below image (not clickable)
             em.set_footer(text=f"Winner by public vote: {winner_member.display_name}")
             
-            await channel.send(embed=em)
-
+            # Send to main channel; if that fails, fall back to ch (if defined)
+            try:
+                await channel.send(embed=em)
             except Exception:
-                await ch.send(embed=em)
+                if 'ch' in locals() and ch and ch != channel:
+                    await ch.send(embed=em)
+                else:
+                    raise
 
 
         # Otherwise set up next round
