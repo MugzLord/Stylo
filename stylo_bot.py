@@ -1051,28 +1051,14 @@ async def scheduler():
             if L == R:
                 any_revote = True
                 new_end = now + timedelta(seconds=vote_sec)
-        
-                # Reset votes/deadline and clear prior voters
-                cur.execute(
-                    "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
-                    (new_end.isoformat(), m["id"]),
-                )
-                cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
-                con.commit()
-        
-                # Re-enable buttons and reset embed totals on original message
+                ...
                 if ch and m["msg_id"]:
                     try:
                         # (your message edit code here)
                         pass
                     except Exception:
                         pass
-            else:
-                # (your normal winner path here)
-                pass
-
             
-                # Re-open the thread if we had just locked it
                 if guild and m["thread_id"]:
                     try:
                         thread = await guild.fetch_channel(m["thread_id"])
@@ -1080,19 +1066,19 @@ async def scheduler():
                     except Exception:
                         pass
             
-                # Announce tie / re-vote
                 if ch:
                     try:
                         await ch.send(embed=discord.Embed(
                             title=f"🔁 Tie-break — {LN} vs {RN}",
-                            description=f"Tied at {L}–{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
+                            description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
                             colour=discord.Colour.orange()
                         ))
                     except Exception:
                         pass
             
                 continue  # skip winner handling; go to next match
-            
+
+           
             # ----- Normal (non-tie) path -----
             winner_id = m["left_id"] if L > R else m["right_id"]
             cur.execute("UPDATE match SET winner_id=? WHERE id=?", (winner_id, m["id"]))
