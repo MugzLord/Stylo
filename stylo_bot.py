@@ -967,7 +967,7 @@ async def scheduler():
             # --- PUBLISH ALL MATCH CARDS FOR THIS ROUND (A, B, C, ...) ---
             cur.execute(
                 "SELECT id FROM match WHERE guild_id=? AND round_index=? ORDER BY id",
-                (gv["guild_id"], new_round),
+                (ev["guild_id"], new_round),
             )
             _match_rows = cur.fetchall()
             
@@ -1082,8 +1082,6 @@ async def scheduler():
             # done entry->voting
     con.close()
     
-        
-
     # Handle voting end -> compute winners; maybe next round
     con = db(); cur = con.cursor()
     cur.execute("SELECT * FROM event WHERE state='voting'")
