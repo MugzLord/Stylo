@@ -530,6 +530,48 @@ async def stylo_show_settings(inter: discord.Interaction):
     em.add_field(name="Log channel", value=mention, inline=False)
     await inter.response.send_message(embed=em, ephemeral=True)
 
+@bot.command(name="stylo_debug")
+@commands.has_guild_permissions(manage_guild=True)
+async def stylo_debug_prefix(ctx: commands.Context):
+    inter_guild_id = ctx.guild.id
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM event WHERE guild_id=?", (inter_guild_id,))
+    ev = cur.fetchone()
+    if not ev:
+        con.close()
+        await ctx.reply("No active event found.")
+        return
+
+    cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (inter_guild_id,))
+    total_entrants = cur.fetchone()["c"] or 0
+    cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=? AND image_url IS NOT NULL", (inter_guild_id,))
+    with_image = cur.fetchone()["c"] or 0
+    cur.execute("SELECT COUNT(*) AS c FROM match WHERE guild_id=? AND round_index=?", (inter_guild_id, ev["round_index"]))
+    matches_in_round = cur.fetchone()["c"] or 0
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+    con.close()
+
+    msg = (
+        f"**Event state:** `{ev['state']}`  |  **Round:** `{ev['round_index']}`\n"
+        f"**Entrants (total):** {total_entrants}\n"
+        f"**Entrants with image:** {with_image}\n"
+        f"**Matches in this round:** {matches_in_round}\n"
+        f"**Entry end (UTC):** {entry_end.isoformat()}  |  **Now:** {now.isoformat()}\n"
+    )
+    if ev["state"] == "entry" and with_image >= 2 and now >= entry_end:
+        msg += "\n➡️ Entries ended and there are at least 2 images. Scheduler should create pairs on its next tick."
+    elif ev["state"] == "entry" and with_image < 2 and now >= entry_end:
+        msg += "\n⛔ Entries ended but fewer than 2 images were saved — no pairs can be created."
+    elif ev["state"] == "voting" and matches_in_round == 0:
+        msg += "\n⚠️ State is 'voting' but no matches exist; something blocked pair creation."
+    else:
+        msg += "\nℹ️ Status looks consistent."
+    await ctx.reply(msg)
+
+
 # Register the group
 bot.tree.add_command(settings_group)
 
@@ -1398,9 +1440,19 @@ async def stylo_reset(inter: discord.Interaction):
 @bot.event
 async def on_ready():
     try:
+        # Force per-guild sync so new/changed commands show instantly
+        for g in bot.guilds:
+            try:
+                await bot.tree.sync(guild=discord.Object(id=g.id))
+                print(f"Synced app commands to guild {g.name} ({g.id})")
+            except Exception as e:
+                print(f"Per-guild sync failed for {g.id}: {e}")
+        # Also do a global sync (fine if it no-ops)
         await bot.tree.sync()
+        print("Global app commands synced.")
     except Exception as e:
         print("Slash sync error:", e)
+
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -1410,7 +1462,6 @@ async def on_ready():
         ch = bot.get_channel(log_id)
         if ch:
             await ch.send("✨ Stylo updated to the latest version and is back online!")
-
 
 if __name__ == "__main__":
     bot.run(TOKEN)
