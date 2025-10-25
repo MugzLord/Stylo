@@ -1124,13 +1124,43 @@ async def scheduler():
         
             if ch:
                 try:
-                    await ch.send(embed=discord.Embed(
+                    # --- Winner image + confetti setup ---
+                    winner_user = guild.get_member(
+                        (await bot.fetch_user(ev["guild_id"])) if False else 0
+                    )  # placeholder; we'll fetch below
+        
+                    winner_entry = None
+                    if winner_id == m["left_id"]:
+                        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["left_id"],))
+                        winner_entry = cur.fetchone()
+                    else:
+                        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["right_id"],))
+                        winner_entry = cur.fetchone()
+        
+                    winner_img = winner_entry["image_url"] if winner_entry and winner_entry["image_url"] else None
+                    winner_user = guild.get_member(winner_entry["user_id"]) if winner_entry else None
+                    winner_display = winner_user.display_name if winner_user else winner_entry["name"]
+        
+                    confetti = "🎊🎉✨💥🎈"
+
+                    em = discord.Embed(
                         title=f"🏁 Result — {LN} vs {RN}",
-                        description=(f"**{LN}**: {L} ({pL}%)\n"
-                                     f"**{RN}**: {R} ({pR}%)\n\n"
-                                     f"**Winner:** {LN if winner_id == m['left_id'] else RN}"),
+                        description=(
+                            f"**{LN}**: {L} ({pL}%)\n"
+                            f"**{RN}**: {R} ({pR}%)\n\n"
+                            f"{confetti}\n"
+                            f"**Winner:** {winner_display} 🎉\n"
+                            f"{confetti}"
+                        ),
                         colour=discord.Colour.green()
-                    ))
+                    )
+        
+                    # Attach winner image if available
+                    if winner_img:
+                        em.set_image(url=winner_img)
+        
+                    await ch.send(embed=em)
+
                 except Exception:
                     pass
         
