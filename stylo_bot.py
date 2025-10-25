@@ -1038,11 +1038,6 @@ async def scheduler():
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
         any_revote = False  # track if at least one match needs a tiebreak re-vote
 
-        for m in matches:
-           
-                except Exception:
-                    pass
-
             # Compute winner
             L = m["left_votes"]; R = m["right_votes"]
 
