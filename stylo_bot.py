@@ -793,7 +793,7 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                     "Please upload **one** image for your entry in this channel.\n"
                     "• **Must be square (1:1)**\n"
                     "You may re-upload to replace it - the **last** image before entries close is used.\n"
-                    "If you’re unsure, feel free to ask an Admin for guidance.\n"
+                    "If you’re unsure, feel free to ask an Admin for guidance.\n\n"
                     "⚠️ This channel will vanish into the IMVU void when the voting starts."
                 ),
                 colour=EMBED_COLOUR
