@@ -388,6 +388,54 @@ async def update_entry_embed_countdown(message: discord.Message, entry_end: date
     except Exception:
         # never crash the bot from a countdown
         return
+async def publish_match_card(channel, match_id: int, round_label: str = ""):
+    # Get pair and timing
+    cur.execute("""
+        SELECT m.round_index,
+               l.id, l.name, l.image_url,
+               r.id, r.name, r.image_url,
+               m.end_utc
+        FROM match m
+        JOIN entrant l ON l.id = m.left_id
+        JOIN entrant r ON r.id = m.right_id
+        WHERE m.id=?
+    """, (match_id,))
+    (round_idx,
+     L_id, L_name, L_img,
+     R_id, R_name, R_img,
+     end_utc) = cur.fetchone()
+
+    # Compose side-by-side image if you have a composer; otherwise use one image
+    file = None
+    composed_url = None
+    if 'compose_pair_image' in globals():
+        try:
+            file, composed_url = await compose_pair_image(L_img, R_img)
+        except Exception:
+            composed_url = L_img or R_img
+    else:
+        composed_url = L_img or R_img
+
+    em = discord.Embed(
+        title=f"{round_label} — {L_name} vs {R_name}" if round_label else f"Round {round_idx + 1} — {L_name} vs {R_name}",
+        colour=discord.Colour.blurple()
+    )
+    em.description = (
+        "Tap a button to vote. One vote per person.\n"
+        "Live totals\n"
+        "Total votes: 0\n"
+        "Split: 0% / 0%\n"
+    )
+    if composed_url:
+        em.set_image(url=composed_url)
+
+    # Your existing voting view
+    view = VoteView(match_id=match_id, left_id=L_id, right_id=R_id, end_utc=end_utc)
+
+    if file:
+        await channel.send(embed=em, view=view, file=file)
+    else:
+        await channel.send(embed=em, view=view)
 
 # ---------- Views ----------
 class MatchView(discord.ui.View):
@@ -913,8 +961,20 @@ async def scheduler():
             # Save matches
             for L, R in pairs:
                 cur.execute("INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                            (ev["guild_id"], round_index, L["id"], R["id"], vote_end.isoformat()))
-            con.commit()
+                            (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat()))
+            con.commit()  
+            
+            # --- PUBLISH ALL MATCH CARDS FOR THIS ROUND (A, B, C, ...) ---
+            cur.execute(
+                "SELECT id FROM match WHERE guild_id=? AND round_index=? ORDER BY id",
+                (gv["guild_id"], new_round),
+            )
+            _match_rows = cur.fetchall()
+            
+            for idx, (match_id,) in enumerate(_match_rows):
+                letter = chr(65 + idx)  # 65 = 'A'
+                await publish_match_card(channel, match_id, round_label=f"Round {new_round + 1}{letter}")
+            # --- END PUBLISH ---
 
             # Update event
             cur.execute("UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
