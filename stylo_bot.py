@@ -962,19 +962,8 @@ async def scheduler():
             for L, R in pairs:
                 cur.execute("INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
                             (ev["guild_id"], round_index, L["id"], R["id"], vote_end.isoformat()))
-            con.commit()
 
-            # --- PUBLISH ALL MATCH CARDS FOR THIS ROUND (A, B, C, ...) ---
-            cur.execute(
-                "SELECT id FROM match WHERE guild_id=? AND round_index=? ORDER BY id",
-                (ev["guild_id"], new_round),
-            )
-            _match_rows = cur.fetchall()
-            
-            for idx, (match_id,) in enumerate(_match_rows):
-                letter = chr(65 + idx)  # 65 = 'A'
-                await publish_match_card(channel, match_id, round_label=f"Round {new_round + 1}{letter}")
-            # --- END PUBLISH ---
+            con.commit()
 
             # Update event
             cur.execute("UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
@@ -1317,15 +1306,13 @@ async def scheduler():
                 colour=discord.Colour.gold()
             )
             if champ_img:
-                em.set_image(url=champ_img)  # winner’s image as the large banner
+                em.set_image(url=champ_img)  # big banner
         
             footer_name = champ_user.display_name if champ_user else champ_name
             em.set_footer(text=f"Winner by public vote: {footer_name}")
         
             await ch.send(embed=em)
-
-
-
+  
         # Otherwise set up next round
         # Build next entrants from winners (must have images already)
         placeholders = ",".join("?" for _ in winners)
