@@ -19,6 +19,10 @@ INTENTS.message_content = True  # not needed
 INTENTS.guilds = True
 INTENTS.members = True
 
+# Local confetti file (Stylo/assets/confetti.gif)
+CONFETTI_GIF_PATH = os.getenv("CONFETTI_GIF_PATH") or os.path.join(os.path.dirname(__file__), "assets", "confetti.gif")
+
+
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # ---------- SQLite helpers ----------
@@ -1149,17 +1153,17 @@ async def scheduler():
                             f"**{LN}**: {L} ({pL}%)\n"
                             f"**{RN}**: {R} ({pR}%)\n\n"
                             f"{confetti}\n"
-                            f"**Winner:** {winner_display} 🎉\n"
+                            f"**Winner:** {winner_user.mention if winner_user else winner_display} 🎉\n"
                             f"{confetti}"
                         ),
                         colour=discord.Colour.green()
                     )
-        
-                    # Attach winner image if available
+                    
                     if winner_img:
                         em.set_image(url=winner_img)
-        
+                    
                     await ch.send(embed=em)
+
 
                 except Exception:
                     pass
@@ -1254,19 +1258,35 @@ async def scheduler():
             except Exception:
                 pass
 
-        # If only one winner -> champion
-        if len(winners) == 1:
-            cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
-            con.commit()
-            # Announce champion
-            cur.execute("SELECT name FROM entrant WHERE id=?", (winners[0],)); champ = cur.fetchone()["name"]
-            if ch:
-                await ch.send(embed=discord.Embed(
-                    title=f"👑 Stylo Champion — {ev['theme']}",
-                    description=f"Winner by public vote: **{champ}**",
-                    colour=discord.Colour.gold()
-                ))
-            continue
+        # Announce champion (with image + @mention + confetti)
+        # winners[0] might be an ID or a tuple — handle both
+        champion_id = winners[0][1] if isinstance(winners[0], (list, tuple)) else winners[0]
+    
+        # Get champion record
+        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (champion_id,))
+        row = cur.fetchone()
+        champ_name = row["name"] if row else "Winner"
+        champ_img  = row["image_url"] if row and row["image_url"] else None
+        champ_user = guild.get_member(row["user_id"]) if row else None
+        champ_display = champ_user.mention if champ_user else champ_name
+    
+        if ch:
+            em = discord.Embed(
+                title=f"👑 Stylo Champion — {ev['theme']}",
+                description=f"Winner by public vote: **{champ_display}**",
+                colour=discord.Colour.gold()
+            )
+            # Winner photo as thumbnail (small); confetti GIF as the big image
+            if champ_img:
+                em.set_thumbnail(url=champ_img)
+            
+            try:
+                file = discord.File(CONFETTI_GIF_PATH, filename="confetti.gif")
+                em.set_image(url="attachment://confetti.gif")
+                await ch.send(embed=em, file=file)
+            except Exception:
+                # If the file is missing/too large, still send the embed
+                await ch.send(embed=em)
 
         # Otherwise set up next round
         # Build next entrants from winners (must have images already)
