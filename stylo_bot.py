@@ -865,12 +865,11 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 # ---------- Message listener: capture image in ticket ----------
 @bot.event
 async def on_message(message: discord.Message):
+    # ignore bots / DMs
     if message.author.bot or not message.guild:
         return
 
-    print(f"[stylo] on_message in #{message.channel.name} from {message.author} | atts={len(message.attachments)}")
-
-    # Is this a Stylo ticket channel?
+    # --- Is this a Stylo ticket channel? ---
     con = db(); cur = con.cursor()
     cur.execute(
         "SELECT entrant.id AS entrant_id, entrant.user_id "
@@ -880,15 +879,22 @@ async def on_message(message: discord.Message):
     )
     row = cur.fetchone()
     if not row:
-        con.close(); return
+        con.close(); 
+        return  # not a ticket channel -> do nothing
 
-    # Only accept the entrant's uploads
-    if message.author.id != row["user_id"]:
-        con.close(); return
+    # --- Only accept the entrant's upload OR an Admin rescue upload ---
+    is_admin_uploader = isinstance(message.author, discord.Member) and (
+        message.author.guild_permissions.manage_guild or message.author.guild_permissions.administrator
+    )
+    if message.author.id != row["user_id"] and not is_admin_uploader:
+        con.close(); 
+        return
+
+    # must have an image attachment
     if not message.attachments:
-        con.close(); return
+        con.close(); 
+        return
 
-    # Accept images even when content_type is missing
     def is_image(att: discord.Attachment) -> bool:
         if att.content_type and att.content_type.startswith("image/"):
             return True
@@ -897,23 +903,25 @@ async def on_message(message: discord.Message):
 
     img_url = next((a.url for a in message.attachments if is_image(a)), None)
     if not img_url:
-        con.close(); return
+        con.close(); 
+        return
 
+    # save image url
     cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
     con.commit(); con.close()
 
-    # (still inside on_message, same indent level as the DB update)
+    # acknowledgement (best-effort)
     try:
         await message.add_reaction("✅")
     except Exception:
         pass
-    
     try:
         await message.channel.send(
             f"Saved your entry, {message.author.mention}! Your latest image will be used."
         )
     except Exception:
         pass
+
 
 
 # ---------- Slash command: /stylo (admin) ----------
