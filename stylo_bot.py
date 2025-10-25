@@ -961,9 +961,9 @@ async def scheduler():
             # Save matches
             for L, R in pairs:
                 cur.execute("INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                            (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat()))
-            con.commit()  
-            
+                            (ev["guild_id"], round_index, L["id"], R["id"], vote_end.isoformat()))
+            con.commit()
+
             # --- PUBLISH ALL MATCH CARDS FOR THIS ROUND (A, B, C, ...) ---
             cur.execute(
                 "SELECT id FROM match WHERE guild_id=? AND round_index=? ORDER BY id",
@@ -1312,26 +1312,18 @@ async def scheduler():
         champ_display = champ_user.mention if champ_user else champ_name
     
         if ch:
-            # --- Stylo Champion Embed (final clean version) ---
             em = discord.Embed(
-                title=f"👑 Stylo Champion — {event_name}",
+                title=f"👑 Stylo Champion — {ev['theme']}",
                 colour=discord.Colour.gold()
             )
-            
-            # Winner's image as large banner
-            em.set_image(url=winner_img_url)
-            
-            # Footer text below image (not clickable)
-            em.set_footer(text=f"Winner by public vote: {winner_member.display_name}")
-            
-            # Send to main channel; if that fails, fall back to ch (if defined)
-            try:
-                await channel.send(embed=em)
-            except Exception:
-                if 'ch' in locals() and ch and ch != channel:
-                    await ch.send(embed=em)
-                else:
-                    raise
+            if champ_img:
+                em.set_image(url=champ_img)  # winner’s image as the large banner
+        
+            footer_name = champ_user.display_name if champ_user else champ_name
+            em.set_footer(text=f"Winner by public vote: {footer_name}")
+        
+            await ch.send(embed=em)
+
 
 
         # Otherwise set up next round
