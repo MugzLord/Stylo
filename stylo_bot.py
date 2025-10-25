@@ -1024,25 +1024,63 @@ async def scheduler():
                 matches = cur.fetchall()
                 # Post each match
                 for m in matches:
-                    # Fetch entrants
-                    cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-                    cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-                    card = await build_vs_card(L["image_url"], R["image_url"])
-                    file = discord.File(fp=card, filename="versus.png")
+                    try:
+                        # Fetch entrants
+                        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
+                        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
+                
+                        # Try to compose the side-by-side image; fall back gracefully
+                        file = None
+                        fallback_img_url = L["image_url"] or R["image_url"]
+                        try:
+                            card = await build_vs_card(L["image_url"], R["image_url"])
+                            file = discord.File(fp=card, filename="versus.png")
+                        except Exception:
+                            file = None  # we’ll just show one image via URL in the embed
+                
+                        em = discord.Embed(
+                            title=f"Round {round_index} — {L['name']} vs {R['name']}",
+                            description="Tap a button to vote. One vote per person.",
+                            colour=EMBED_COLOUR
+                        )
+                        em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                
+                        # If compose failed, at least show one image as the banner
+                        if not file and fallback_img_url:
+                            em.set_image(url=fallback_img_url)
+                
+                        end_dt = vote_end
+                        view = MatchView(m["id"], end_dt, L["name"], R["name"])
+                
+                        if file:
+                            msg = await ch.send(embed=em, view=view, file=file)
+                        else:
+                            msg = await ch.send(embed=em, view=view)
+                
+                        # Create thread for chat (already guarded in your code)
+                        try:
+                            thread = await msg.create_thread(
+                                name=f"💬 {L['name']} vs {R['name']} — Chat",
+                                auto_archive_duration=1440
+                            )
+                            await thread.send(embed=discord.Embed(
+                                title="Supporter Chat",
+                                description="Talk here! Votes are via buttons on the parent post above.",
+                                colour=discord.Colour.dark_grey()
+                            ))
+                            thread_id = thread.id
+                        except Exception:
+                            thread_id = None
+                
+                        cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
+                        con.commit()
+                        await asyncio.sleep(0.4)  # be nice to rate limits
+                
+                    except Exception as e:
+                        # Don’t let one bad pair stop the rest
+                        print(f"[stylo] failed to post match {m['id']}: {e}")
+                        continue
 
-                    em = discord.Embed(
-                        title=f"Round {round_index} — {L['name']} vs {R['name']}",
-                        description="Tap a button to vote. One vote per person.",
-                        colour=EMBED_COLOUR
-                    )
-                    em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                    
-                    end_dt = vote_end  # already UTC-aware
-                    #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
-
-                    view = MatchView(m["id"], end_dt, L["name"], R["name"])
-
-                    msg = await ch.send(embed=em, view=view, file=file)
                     # Create thread for chat
                     try:
                         thread = await msg.create_thread(
