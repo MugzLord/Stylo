@@ -1039,33 +1039,45 @@ async def scheduler():
         any_revote = False  # track if at least one match needs a tiebreak re-vote
 
         for m in matches:
-            # Compute winner
+            # Compute votes
             L = m["left_votes"]; R = m["right_votes"]
         
             # Fetch names (used in both paths)
             cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
-            LN = cur.fetchone()["name"]
+            LN = (cur.fetchone() or {"name": "Left"})["name"]
             cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
-            RN = cur.fetchone()["name"]
+            RN = (cur.fetchone() or {"name": "Right"})["name"]
         
+            # --- Tie case → schedule re-vote ---
             if L == R:
                 any_revote = True
                 new_end = now + timedelta(seconds=vote_sec)
-                ...
+        
+                # Reset votes/deadline and clear prior voters
+                cur.execute(
+                    "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                    (new_end.isoformat(), m["id"]),
+                )
+                cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
+                con.commit()
+        
+                # Re-enable buttons / reset message (if you edit the original post)
                 if ch and m["msg_id"]:
                     try:
-                        # (your message edit code here)
+                        # TODO: your message edit code here (re-enable buttons, reset totals on embed)
                         pass
                     except Exception:
                         pass
-            
+        
+                # Re-open the thread (if locked previously)
                 if guild and m["thread_id"]:
                     try:
                         thread = await guild.fetch_channel(m["thread_id"])
                         await thread.edit(locked=False, archived=False)
                     except Exception:
                         pass
-            
+        
+                # Announce the re-vote
                 if ch:
                     try:
                         await ch.send(embed=discord.Embed(
@@ -1075,7 +1087,35 @@ async def scheduler():
                         ))
                     except Exception:
                         pass
-            
+        
+                continue  # skip normal winner handling; go to next match
+        
+            # --- Normal (non-tie) path ---
+            winner_id = m["left_id"] if L > R else m["right_id"]
+            cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+                        (winner_id, now.isoformat(), m["id"]))
+            con.commit()
+        
+            winners.append((m["id"], winner_id, LN, RN, L, R))
+        
+            # Post results (announce winner + percentages)
+            total = L + R
+            pL = round((L / total) * 100, 1) if total else 0.0
+            pR = round((R / total) * 100, 1) if total else 0.0
+        
+            if ch:
+                try:
+                    await ch.send(embed=discord.Embed(
+                        title=f"🏁 Result — {LN} vs {RN}",
+                        description=(f"**{LN}**: {L} ({pL}%)\n"
+                                     f"**{RN}**: {R} ({pR}%)\n\n"
+                                     f"**Winner:** {LN if winner_id == m['left_id'] else RN}"),
+                        colour=discord.Colour.green()
+                    ))
+                except Exception:
+                    pass
+        
+                    
                 continue  # skip winner handling; go to next match
 
            
@@ -1108,16 +1148,16 @@ async def scheduler():
             pL = round((L / total) * 100, 1) if total else 0.0
             pR = round((R / total) * 100, 1) if total else 0.0
             if ch:
-                await ch.send(embed=discord.Embed(
-                    title=f"🏁 Result — {LN} vs {RN}",
-                    description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n**Winner:** "
-                                f"**{LN if winner_id==m['left_id'] else RN}**",
-                    colour=discord.Colour.green()
-                ))
+                try:
+                    await ch.send(embed=discord.Embed(
+                        title=f"🏁 Result — {LN} vs {RN}",
+                        description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n**Winner:** "
+                                    f"{LN if winner_id==m['left_id'] else RN}",
+                        colour=discord.Colour.green()
+                    ))
+                except Exception:
+                    pass
 
-                    except Exception:
-                        pass
-            
                 # Skip winner handling for this match
                 continue
             
