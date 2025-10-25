@@ -1038,42 +1038,39 @@ async def scheduler():
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
         any_revote = False  # track if at least one match needs a tiebreak re-vote
 
+        for m in matches:
             # Compute winner
             L = m["left_votes"]; R = m["right_votes"]
-
+        
             # Fetch names (used in both paths)
-            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LN = cur.fetchone()["name"]
-            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); RN = cur.fetchone()["name"]
-            
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
+            LN = cur.fetchone()["name"]
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
+            RN = cur.fetchone()["name"]
+        
             if L == R:
                 any_revote = True
                 new_end = now + timedelta(seconds=vote_sec)
-            
+        
                 # Reset votes/deadline and clear prior voters
-                cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
-                            (new_end.isoformat(), m["id"]))
+                cur.execute(
+                    "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                    (new_end.isoformat(), m["id"]),
+                )
                 cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
                 con.commit()
-            
+        
                 # Re-enable buttons and reset embed totals on original message
                 if ch and m["msg_id"]:
                     try:
-                        msg = await ch.fetch_message(m["msg_id"])
-                        if msg.embeds:
-                            em = msg.embeds[0]
-                            if em.fields:
-                                em.set_field_at(0, name="Live totals",
-                                                value="Total votes: **0**\nSplit: **0% / 0%**",
-                                                inline=False)
-                            else:
-                                em.add_field(name="Live totals",
-                                             value="Total votes: **0**\nSplit: **0% / 0%**",
-                                             inline=False)
-                            em.set_footer(text=f"Voting ends {rel_ts(new_end)}")
-                            view = MatchView(m["id"], new_end, LN, RN)  # re-enabled buttons
-                            await msg.edit(embed=em, view=view)
+                        # (your message edit code here)
+                        pass
                     except Exception:
                         pass
+            else:
+                # (your normal winner path here)
+                pass
+
             
                 # Re-open the thread if we had just locked it
                 if guild and m["thread_id"]:
