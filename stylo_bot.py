@@ -715,7 +715,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------- Modal: Entrant info (name, caption) ----------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="YaEli", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="MikeyMoon", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
