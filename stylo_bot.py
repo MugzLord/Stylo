@@ -663,7 +663,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------- Modal: Entrant info (name, caption) ----------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="YaEli", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="MikeyMoon / Mike", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -1123,50 +1123,45 @@ async def scheduler():
             pR = round((R / total) * 100, 1) if total else 0.0
         
             if ch:
+                # --- Winner image + mention
                 try:
-                    # --- Winner image + confetti setup ---
-                    winner_user = guild.get_member(
-                        (await bot.fetch_user(ev["guild_id"])) if False else 0
-                    )  # placeholder; we'll fetch below
-        
-                    winner_entry = None
+                    # fetch winning entrant row
                     if winner_id == m["left_id"]:
                         cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["left_id"],))
-                        winner_entry = cur.fetchone()
                     else:
                         cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["right_id"],))
-                        winner_entry = cur.fetchone()
-        
+                    winner_entry = cur.fetchone()
+                
                     winner_img = winner_entry["image_url"] if winner_entry and winner_entry["image_url"] else None
-                    winner_user = guild.get_member(winner_entry["user_id"]) if winner_entry else None
-                    winner_display = winner_user.display_name if winner_user else winner_entry["name"]
-        
-                    confetti = "🎊🎉✨💥🎈"
-
+                    # resolve member for proper mention; fall back to raw mention if not cached
+                    winner_member = guild.get_member(winner_entry["user_id"]) if winner_entry else None
+                    winner_display = winner_member.display_name if winner_member else (winner_entry["name"] if winner_entry else "Unknown")
+                    winner_mention = (
+                        winner_member.mention
+                        if winner_member
+                        else (f"<@{winner_entry['user_id']}>" if winner_entry else "the winner")
+                    )
+                
                     em = discord.Embed(
                         title=f"🏁 Result — {LN} vs {RN}",
                         description=(
                             f"**{LN}**: {L} ({pL}%)\n"
                             f"**{RN}**: {R} ({pR}%)\n\n"
-                            f"{confetti}\n"
-                            f"**Winner:** {winner_display} 🎉\n"
-                            f"{confetti}"
+                            f"🏆 **Winner:** {winner_mention}\n"
                         ),
-                        colour=discord.Colour.green()
+                        colour=discord.Colour.green(),
                     )
-        
-                    # Attach winner image if available
+                
+                    # attach winner image if available
                     if winner_img:
                         em.set_image(url=winner_img)
-        
+                
                     await ch.send(embed=em)
-
+                
                 except Exception:
                     pass
-        
-                    
+                     
                 continue  # skip winner handling; go to next match
-
            
             # ----- Normal (non-tie) path -----
             winner_id = m["left_id"] if L > R else m["right_id"]
