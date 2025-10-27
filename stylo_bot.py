@@ -1298,25 +1298,44 @@ async def scheduler():
             winner_name = (w["name"] if w and w["name"] else "Unknown")
             winner_img  = (w["image_url"] if w and w["image_url"] else None)
         
-            # try a proper mention
+            # mention (best effort)
             winner_mention = None
             if w and guild:
-                mem = guild.get_member(w["user_id"])
-                winner_mention = mem.mention if mem else (f"<@{w['user_id']}>" if w["user_id"] else None)
+                m = guild.get_member(w["user_id"])
+                winner_mention = m.mention if m else (f"<@{w['user_id']}>" if w["user_id"] else None)
         
             em = discord.Embed(
                 title=f"👑 Stylo Champion — {ev['theme']}",
                 description=f"Winner by public vote: **{winner_name}**" + (f"\n{winner_mention}" if winner_mention else ""),
                 colour=discord.Colour.gold()
             )
+        
+            file_to_send = None
             if winner_img:
-                em.set_image(url=winner_img)
-            else:
-                print(f"[stylo] champion has no image_url (entrant {winner_id})")
+                try:
+                    import aiohttp, io
+                    from PIL import Image
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(winner_img) as r:
+                            b = await r.read()
+                    im = Image.open(io.BytesIO(b))
+                    # always convert to RGB PNG to avoid format issues (e.g., HEIC/WEBP anim)
+                    buf = io.BytesIO()
+                    im.convert("RGB").save(buf, format="PNG", optimize=True)
+                    buf.seek(0)
+                    file_to_send = discord.File(buf, filename="champion.png")
+                    em.set_image(url="attachment://champion.png")
+                except Exception as e:
+                    print(f"[stylo] champion image fetch/convert failed: {e!r}")
         
             if ch:
-                await ch.send(embed=em)
+                if file_to_send:
+                    await ch.send(embed=em, file=file_to_send)
+                else:
+                    await ch.send(embed=em)
+        
             continue
+
 
 
         # Otherwise set up next round
