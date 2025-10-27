@@ -533,8 +533,7 @@ async def scheduler():
             cur.execute(
                 "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
                 (ev["guild_id"],)
-            )
-            entrants = cur.fetchall()
+                        entrants = cur.fetchall()
 
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
@@ -614,38 +613,60 @@ async def scheduler():
                             (ev["guild_id"], round_index))
                 matches = cur.fetchall()
                 for m in matches:
+                    # --- POST ONE MATCH (REPLACE YOUR CURRENT TRY/EXCEPT FOR SENDING) ---
                     try:
+                        # Fetch entrant rows for this match
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
                         if not L or not R:
                             continue
-
+                        
+                        Lurl = (L["image_url"] or "").strip()
+                        Rurl = (R["image_url"] or "").strip()
+                        
                         em = discord.Embed(
                             title=f"Round {round_index} — {L['name']} vs {R['name']}",
                             description="Tap a button to vote. One vote per person.",
                             colour=EMBED_COLOUR
                         )
                         em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                        
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
-
+                        
                         try:
-                            # Composite image
-                            card = await build_vs_card((L["image_url"] or "").strip(), (R["image_url"] or "").strip())
+                            # 1) Try to post a composite VS image
+                            if not (Lurl and Rurl):
+                                raise RuntimeError("Missing image URL(s)")
+                        
+                            card = await build_vs_card(Lurl, Rurl)
                             file = discord.File(fp=card, filename="versus.png")
-                            # IMPORTANT: tell the embed to use the attachment
+                        
+                            # IMPORTANT: make the embed render the attached image inline
                             em.set_image(url="attachment://versus.png")
+                        
                             msg = await ch.send(embed=em, view=view, file=file)
-                        except Exception:
-                            # Fallback: show both images so voters can actually see
-                            em_left  = discord.Embed(title=L["name"], colour=discord.Colour.dark_grey())
-                            em_right = discord.Embed(title=R["name"], colour=discord.Colour.dark_grey())
-                            Lurl = (L["image_url"] or "").strip(); Rurl = (R["image_url"] or "").strip()
-                            if Lurl: em_left.set_image(url=Lurl)
-                            else:    em_left.description = "No image saved."
-                            if Rurl: em_right.set_image(url=Rurl)
-                            else:    em_right.description = "No image saved."
-                            msg = await ch.send(embeds=[em, em_left, em_right], view=view)
-
+                        
+                        except Exception as e:
+                            print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                        
+                            # 2) Hard fallback: two separate image embeds so voters still see both looks
+                            em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
+                            em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
+                        
+                            if Lurl:
+                                em_left.set_image(url=Lurl)
+                            else:
+                                em_left.description = "No image saved."
+                        
+                            if Rurl:
+                                em_right.set_image(url=Rurl)
+                            else:
+                                em_right.description = "No image saved."
+                        
+                            # Send the header (buttons) first, then the two images
+                            header = await ch.send(embed=em, view=view)
+                            msg = await ch.send(embeds=[em_left, em_right])
+                        # ---------- END SEND MATCH POST ----------
                         # thread (best-effort)
                         thread_id = None
                         try:
@@ -841,12 +862,21 @@ async def _wait_ready():
 @bot.event
 async def on_ready():
     try:
+        # Global sync
         await bot.tree.sync()
+        # Force per-guild sync so new commands show up right away
+        for g in bot.guilds:
+            try:
+                await bot.tree.sync(guild=discord.Object(id=g.id))
+            except Exception as e:
+                print("Guild sync error:", g.id, e)
     except Exception as e:
         print("Slash sync error:", e)
+
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
