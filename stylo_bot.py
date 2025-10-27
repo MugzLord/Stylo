@@ -797,8 +797,14 @@ async def scheduler():
             con.commit()
             
             # Resolve channel
+            # Resolve channel
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if guild else None
+            
+            # 🔧 NEW: nuke all entry tickets once voting begins
+            if guild:
+                await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
+
 
             print(f"[stylo] posting to channel: {ev['main_channel_id']} resolved={bool(ch)}")
             if not ch and guild and guild.system_channel:
@@ -842,145 +848,148 @@ async def scheduler():
                     pass
 
                 # Fetch matches for posting (ROUND 1)
-                cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
-                            (ev["guild_id"], round_index))
-                matches = cur.fetchall()
-
-                # Post each match (no tiebreak check here - first posting only)
-                for m in matches:
-                    # Fetch entrants
-                    cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-                    cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-                
-                    # Base embed
-                    em = discord.Embed(
-                        title=f"Round {round_index} — {L['name']} vs {R['name']}",
-                        description="Tap a button to vote. One vote per person.",
-                        colour=EMBED_COLOUR
-                    )
-                    em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                
-                    end_dt = vote_end  # timezone-aware UTC
-                    view = MatchView(m["id"], end_dt, L["name"], R["name"])
-                
-                    # Try composite VS card; fall back if it fails
-                    try:
-                        card = await build_vs_card(L["image_url"], R["image_url"])
-                        file = discord.File(fp=card, filename="versus.png")
-                        msg = await ch.send(embed=em, view=view, file=file)
-                    except Exception as e:
-                        print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-                        em.add_field(
-                            name="Looks",
-                            value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
-                            inline=False
-                        )
-                        msg = await ch.send(embed=em, view=view)
-                
-                    # Thread for hype (best effort)
-                    thread_id = None
-                    try:
-                        thread = await msg.create_thread(
-                            name=f"💬 {L['name']} vs {R['name']} — Chat",
-                            auto_archive_duration=1440
-                        )
-                        await thread.send(embed=discord.Embed(
-                            title="Supporter Chat",
-                            description="Talk here! Votes are via buttons on the parent post above.",
-                            colour=discord.Colour.dark_grey()
-                        ))
-                        thread_id = thread.id
-                    except Exception as e:
-                        print(f"[stylo] Thread create failed for match {m['id']}: {e!r}")
-                        thread_id = None
-                
-                    cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
-                    con.commit()
-                    await asyncio.sleep(0.4)
-                
-                # done posting round 1
-            # end if ch
-    # end entry loop
-
-    # Handle voting end -> compute winners; maybe next round
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM event WHERE state='voting'")
-    for ev in cur.fetchall():
-        round_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)  # stored vote end
-        if now < round_end:
-            continue
-
-        guild = bot.get_guild(ev["guild_id"])
-        ch = guild.get_channel(ev["main_channel_id"]) if guild else None
-
-        cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
-                    (ev["guild_id"], ev["round_index"]))
-        matches = cur.fetchall()
-        winners = []
-        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-        any_revote = False
-
-        for m in matches:
-            L = m["left_votes"]; R = m["right_votes"]
-        
-            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
-            LN = (cur.fetchone() or {"name": "Left"})["name"]
-            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
-            RN = (cur.fetchone() or {"name": "Right"})["name"]
-        
-            # Tie -> re-vote
-            if L == R:
-                any_revote = True
-                new_end = now + timedelta(seconds=vote_sec)
-        
                 cur.execute(
-                    "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
-                    (new_end.isoformat(), m["id"]),
+                    "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
+                    (ev["guild_id"], round_index)
                 )
-                cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
-                con.commit()
-        
-                if ch and m["msg_id"]:
+                matches = cur.fetchall()
+                
+                for m in matches:
                     try:
-                        msg = await ch.fetch_message(m["msg_id"])
-                        em = msg.embeds[0] if msg.embeds else discord.Embed(
-                            title=f"Round {ev['round_index']} — {LN} vs {RN}",
+                        # Fetch entrants (robust)
+                        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
+                        L = cur.fetchone()
+                        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
+                        R = cur.fetchone()
+                        if not L or not R:
+                            print(f"[stylo] missing entrant rows for match {m['id']}; skipping")
+                            continue
+                
+                        # Base embed
+                        em = discord.Embed(
+                            title=f"Round {round_index} — {L['name']} vs {R['name']}",
                             description="Tap a button to vote. One vote per person.",
                             colour=EMBED_COLOUR
                         )
-                        if em.fields:
-                            em.set_field_at(0, name="Live totals",
-                                            value="Total votes: **0**\nSplit: **0% / 0%**",
-                                            inline=False)
-                        else:
-                            em.add_field(name="Live totals",
-                                         value="Total votes: **0**\nSplit: **0% / 0%**",
-                                         inline=False)
+                        em.add_field(name="Live totals",
+                                     value="Total votes: **0**\nSplit: **0% / 0%**",
+                                     inline=False)
                 
-                        view = MatchView(m["id"], new_end, LN, RN)
-                        await msg.edit(embed=em, view=view)
-
-                    except Exception:
-                        pass
-        
-                if guild and m["thread_id"]:
-                    try:
-                        thread = await guild.fetch_channel(m["thread_id"])
-                        await thread.edit(locked=False, archived=False)
-                    except Exception:
-                        pass
-        
-                if ch:
-                    try:
-                        await ch.send(embed=discord.Embed(
-                            title=f"🔁 Tie-break — {LN} vs {RN}",
-                            description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
-                            colour=discord.Colour.orange()
-                        ))
-                    except Exception:
-                        pass
-        
-                continue  # go next match
+                        end_dt = vote_end  # timezone-aware UTC
+                        view = MatchView(m["id"], end_dt, L["name"], R["name"])
+                
+                        # Try composite VS card; fall back to links if fetch/composite fails
+                        try:
+                            card = await build_vs_card(L["image_url"], R["image_url"])
+                            file = discord.File(fp=card, filename="versus.png")
+                            msg = await ch.send(embed=em, view=view, file=file)
+                        except Exception as e:
+                            print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                            em.add_field(
+                                name="Looks",
+                                value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
+                                inline=False
+                            )
+                            msg = await ch.send(embed=em, view=view)
+                
+                        # Thread for hype (best effort)
+                        thread_id = None
+                        try:
+                            thread = await msg.create_thread(
+                                name=f"💬 {L['name']} vs {R['name']} — Chat",
+                                auto_archive_duration=1440
+                            )
+                            await thread.send(embed=discord.Embed(
+                                title="Supporter Chat",
+                                description="Talk here! Votes are via buttons on the parent post above.",
+                                colour=discord.Colour.dark_grey()
+                            ))
+                            thread_id = thread.id
+                        except Exception as e:
+                            print(f"[stylo] Thread create failed for match {m['id']}: {e!r}")
+                
+                        # Persist msg/thread IDs
+                        cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
+                        con.commit()
+                
+                        await asyncio.sleep(0.4)  # rate-limit friendly
+                
+                    except Exception as e:
+                        # Never let one bad pair kill the rest
+                        print(f"[stylo] posting match {m['id']} failed: {e!r}")
+                        continue
+                
+                        guild = bot.get_guild(ev["guild_id"])
+                        ch = guild.get_channel(ev["main_channel_id"]) if guild else None
+                
+                        cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+                                    (ev["guild_id"], ev["round_index"]))
+                        matches = cur.fetchall()
+                        winners = []
+                        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+                        any_revote = False
+                
+                        for m in matches:
+                            L = m["left_votes"]; R = m["right_votes"]
+                        
+                            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
+                            LN = (cur.fetchone() or {"name": "Left"})["name"]
+                            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
+                            RN = (cur.fetchone() or {"name": "Right"})["name"]
+                        
+                            # Tie -> re-vote
+                            if L == R:
+                                any_revote = True
+                                new_end = now + timedelta(seconds=vote_sec)
+                        
+                                cur.execute(
+                                    "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                                    (new_end.isoformat(), m["id"]),
+                                )
+                                cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
+                                con.commit()
+                        
+                                if ch and m["msg_id"]:
+                                    try:
+                                        msg = await ch.fetch_message(m["msg_id"])
+                                        em = msg.embeds[0] if msg.embeds else discord.Embed(
+                                            title=f"Round {ev['round_index']} — {LN} vs {RN}",
+                                            description="Tap a button to vote. One vote per person.",
+                                            colour=EMBED_COLOUR
+                                        )
+                                        if em.fields:
+                                            em.set_field_at(0, name="Live totals",
+                                                            value="Total votes: **0**\nSplit: **0% / 0%**",
+                                                            inline=False)
+                                        else:
+                                            em.add_field(name="Live totals",
+                                                         value="Total votes: **0**\nSplit: **0% / 0%**",
+                                                         inline=False)
+                                
+                                        view = MatchView(m["id"], new_end, LN, RN)
+                                        await msg.edit(embed=em, view=view)
+                
+                                    except Exception:
+                                        pass
+                        
+                                if guild and m["thread_id"]:
+                                    try:
+                                        thread = await guild.fetch_channel(m["thread_id"])
+                                        await thread.edit(locked=False, archived=False)
+                                    except Exception:
+                                        pass
+                        
+                                if ch:
+                                    try:
+                                        await ch.send(embed=discord.Embed(
+                                            title=f"🔁 Tie-break — {LN} vs {RN}",
+                                            description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
+                                            colour=discord.Colour.orange()
+                                        ))
+                                    except Exception:
+                                        pass
+                        
+                                continue  # go next match
         
             # Normal path -> set winner, announce with image
             winner_id = m["left_id"] if L > R else m["right_id"]
@@ -1020,8 +1029,9 @@ async def scheduler():
                         colour=discord.Colour.green(),
                     )
                     if winner_img:
-                        em.set_image(url=winner_img)
+                        em.set_thumbnail(url=winner_img)
                     await ch.send(embed=em)
+
                 except Exception:
                     pass
 
