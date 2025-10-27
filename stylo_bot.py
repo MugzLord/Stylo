@@ -274,7 +274,7 @@ class MatchView(discord.ui.View):
 
 # ---------------- Start modal ----------------
 class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
-    theme = discord.ui.TextInput(label="Theme / Title", placeholder="Enchanted Garden", max_length=100)
+    theme = discord.ui.TextInput(label="Theme / Title", max_length=100)
     entry_hours = discord.ui.TextInput(label="Entry window (hours)", default="24")
     vote_hours  = discord.ui.TextInput(label="Vote window per round (hours)", default="24")
 
@@ -329,7 +329,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------------- Join modal ----------------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholer="MikeyMoon / Mike", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
