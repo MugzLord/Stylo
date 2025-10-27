@@ -1004,26 +1004,51 @@ async def scheduler():
                 matches = cur.fetchall()
                 # Post each match
                 for m in matches:
+                    if any_revote:
+                        # Keep event in 'voting' and push its round end to the latest match end.
+                        cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                                    (ev["guild_id"], ev["round_index"]))
+                        mx = cur.fetchone()["mx"]
+                        if mx:
+                            cur.execute("UPDATE event SET entry_end_utc=? WHERE guild_id=?", (mx, ev["guild_id"]))
+                            con.commit()
+                        # Don't unlock main chat or advance rounds; wait for tie re-votes to finish
+                        continue
+                
                     # Fetch entrants
                     cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                     cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-                    card = await build_vs_card(L["image_url"], R["image_url"])
-                    file = discord.File(fp=card, filename="versus.png")
-
+                
+                    # Prepare the embed regardless of image success
                     em = discord.Embed(
-                        title=f"Round {round_index} — {L['name']} vs {R['name']}",
+                        title=f"Round {new_round} — {L['name']} vs {R['name']}",
                         description="Tap a button to vote. One vote per person.",
                         colour=EMBED_COLOUR
                     )
                     em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                    
-                    end_dt = vote_end  # already UTC-aware
-                    #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
-
+                
+                    end_dt = vote_end  # already timezone-aware UTC
                     view = MatchView(m["id"], end_dt, L["name"], R["name"])
-
-                    msg = await ch.send(embed=em, view=view, file=file)
-                    # Create thread for chat
+                
+                    msg = None
+                    try:
+                        # Try building the combined VS card image
+                        card = await build_vs_card(L["image_url"], R["image_url"])
+                        file = discord.File(fp=card, filename="versus.png")
+                        msg = await ch.send(embed=em, view=view, file=file)
+                    except Exception as e:
+                        # Log error but don't stop posting remaining matches
+                        print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                        # Fallback: just post names + raw links
+                        em.add_field(
+                            name="Looks",
+                            value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
+                            inline=False
+                        )
+                        msg = await ch.send(embed=em, view=view)
+                
+                    # Create a discussion thread
+                    thread_id = None
                     try:
                         thread = await msg.create_thread(
                             name=f"💬 {L['name']} vs {R['name']} — Chat",
@@ -1035,23 +1060,16 @@ async def scheduler():
                             colour=discord.Colour.dark_grey()
                         ))
                         thread_id = thread.id
-                    except Exception:
+                    except Exception as e:
+                        print(f"[stylo] Thread create failed for match {m['id']}: {e!r}")
                         thread_id = None
-
-                    # After posting all Round 1 matches for this guild, delete tickets
-                    try:
-                        await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed — cleanup tickets")
-                    except Exception:
-                        pass
-
-
+                
+                    # Save message + thread IDs
                     cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
                     con.commit()
                     await asyncio.sleep(0.4)  # rate-limit friendly
-            # done entry->voting
-    con.close()
-    
-        
+                
+                con.close()
 
     # Handle voting end -> compute winners; maybe next round
     con = db(); cur = con.cursor()
