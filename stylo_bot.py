@@ -776,10 +776,13 @@ async def scheduler():
                 con.commit(); continue
 
             random.shuffle(entrants)
-            pairs = [(entrants[i], entrants[i+1]) for i in range(0, len(entrants) - len(entrants)%2, 2)]
-            byes = []
-            if len(entrants) % 2 == 1:
-                byes.append(entrants[-1])
+            pairs = []
+            for i in range(0, len(entrants), 2):
+                if i + 1 < len(entrants):
+                    pairs.append((entrants[i], entrants[i + 1]))
+            # (optional) byes if odd
+            byes = entrants[-1:] if (len(entrants) % 2 == 1) else []
+
 
             round_index = 1
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
@@ -1098,10 +1101,12 @@ async def scheduler():
         cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids_only)
         next_entrants = cur.fetchall()
         random.shuffle(next_entrants)
-        pairs = [(next_entrants[i], next_entrants[i+1]) for i in range(0, len(next_entrants)-len(next_entrants)%2, 2)]
-        byes = []
-        if len(next_entrants) % 2 == 1:
-            byes.append(next_entrants[-1])
+        pairs = []
+        for i in range(0, len(next_entrants), 2):
+            if i + 1 < len(next_entrants):
+                pairs.append((next_entrants[i], next_entrants[i + 1]))
+        byes = next_entrants[-1:] if (len(next_entrants) % 2 == 1) else []
+
 
         new_round = ev["round_index"] + 1
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
@@ -1196,148 +1201,6 @@ async def stylo_debug(inter: discord.Interaction):
 
     await inter.response.send_message(msg, ephemeral=True)
 # end of the error debugger
-
-#panic button
-@bot.tree.command(name="stylo_force_pairs", description="Force-post all pairs from saved entry images (admin only).")
-async def stylo_force_pairs(inter: discord.Interaction):
-    if not is_admin(inter.user):
-        await inter.response.send_message("Admins only.", ephemeral=True); 
-        return
-
-    await inter.response.defer(ephemeral=True)
-
-    con = db(); cur = con.cursor()
-    try:
-        # Load event
-        cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
-        ev = cur.fetchone()
-        if not ev:
-            await inter.followup.send("No event found for this server.", ephemeral=True); 
-            return
-
-        # Collect entrants that actually have saved images
-        cur.execute("SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL", (inter.guild_id,))
-        entrants = cur.fetchall()
-        if len(entrants) < 2:
-            await inter.followup.send("Not enough saved images to make pairs. Need at least 2.", ephemeral=True)
-            return
-
-        # Shuffle and pair
-        random.shuffle(entrants)
-        pairs = [(entrants[i], entrants[i+1]) for i in range(0, len(entrants) - len(entrants)%2, 2)]
-        byes = []
-        if len(entrants) % 2 == 1:
-            byes.append(entrants[-1])  # not used yet
-
-        # Determine round + vote time
-        current_round = max(1, int(ev["round_index"]) or 1)
-        # If we're still in 'entry', start Round 1; if we're in 'voting' but stuck, reuse current_round
-        round_index = 1 if ev["state"] == "entry" else current_round
-        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-        now = datetime.now(timezone.utc)
-        vote_end = now + timedelta(seconds=vote_sec)
-
-        # Insert matches with end time
-        for L, R in pairs:
-            cur.execute(
-                "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                (inter.guild_id, round_index, L["id"], R["id"], vote_end.isoformat())
-            )
-        con.commit()
-
-        # Flip event to voting and set window end
-        cur.execute(
-            "UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
-            (round_index, vote_end.isoformat(), ev["main_channel_id"] or inter.channel_id, inter.guild_id)
-        )
-        con.commit()
-
-        guild = inter.guild
-        ch = guild.get_channel(ev["main_channel_id"]) if ev["main_channel_id"] else inter.channel
-
-        # Nuke all entry tickets now that voting begins
-        if guild:
-            await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
-
-        # Post announcement
-        if ch:
-            await ch.send(embed=discord.Embed(
-                title=f"🆚 Stylo — Round {round_index} begins!",
-                description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
-                            f"Main chat is locked; use each match thread for hype.",
-                colour=EMBED_COLOUR
-            ))
-            # Lock main channel chat during voting
-            try:
-                await ch.set_permissions(guild.default_role, send_messages=False)
-            except Exception:
-                pass
-
-        # Fetch matches we just created
-        cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
-                    (inter.guild_id, round_index))
-        matches = cur.fetchall()
-
-        # Post each match - robust loop
-        for m in matches:
-            try:
-                cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-                cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-                if not L or not R:
-                    print(f"[stylo_force_pairs] missing entrant rows for match {m['id']}; skipping")
-                    continue
-
-                em = discord.Embed(
-                    title=f"Round {round_index} — {L['name']} vs {R['name']}",
-                    description="Tap a button to vote. One vote per person.",
-                    colour=EMBED_COLOUR
-                )
-                em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-
-                view = MatchView(m["id"], vote_end, L["name"], R["name"])
-
-                try:
-                    card = await build_vs_card(L["image_url"], R["image_url"])
-                    file = discord.File(fp=card, filename="versus.png")
-                    msg = await ch.send(embed=em, view=view, file=file)
-                except Exception as e:
-                    print(f"[stylo_force_pairs] VS card failed for match {m['id']}: {e!r}")
-                    em.add_field(
-                        name="Looks",
-                        value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
-                        inline=False
-                    )
-                    msg = await ch.send(embed=em, view=view)
-
-                # Thread (best-effort)
-                thread_id = None
-                try:
-                    thread = await msg.create_thread(
-                        name=f"💬 {L['name']} vs {R['name']} — Chat",
-                        auto_archive_duration=1440
-                    )
-                    await thread.send(embed=discord.Embed(
-                        title="Supporter Chat",
-                        description="Talk here! Votes are via buttons on the parent post above.",
-                        colour=discord.Colour.dark_grey()
-                    ))
-                    thread_id = thread.id
-                except Exception as e:
-                    print(f"[stylo_force_pairs] thread create failed for match {m['id']}: {e!r}")
-
-                cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
-                con.commit()
-                await asyncio.sleep(0.4)
-
-            except Exception as e:
-                print(f"[stylo_force_pairs] posting match {m['id']} failed: {e!r}")
-                continue
-
-        await inter.followup.send("Forced pairs posted. ✅", ephemeral=True)
-
-    finally:
-        con.close()
-#end of panic button
 
 # ---------- Ready ----------
 @bot.event
