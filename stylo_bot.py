@@ -1036,6 +1036,7 @@ async def scheduler():
                             msg = await ch.send(embed=em, view=view, file=file)
                         except Exception as e:
                             print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                            # Fallback: still post so voting can happen
                             em.add_field(
                                 name="Looks",
                                 value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
