@@ -498,15 +498,38 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             await inter.response.send_message("Admins only.", ephemeral=True)
             return
 
+        # Defer immediately so Discord doesn't time out the modal submit
         try:
-            # parse "2", "2h", "90m", "1.5h" etc.
+            await inter.response.defer(ephemeral=False)
+        except discord.InteractionResponded:
+            pass  # already deferred/answered somehow
+
+        try:
+            # Parse durations like "2", "2h", "90m", "1.5h"
             entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
             vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
 
             theme = str(self.theme).strip()
             if not theme:
-                await inter.response.send_message("Theme is required.", ephemeral=True)
+                await inter.followup.send("Theme is required.", ephemeral=True)
                 return
+
+            # Basic channel permission sanity check (send+embed)
+            ch = inter.channel
+            me = inter.guild.me if inter.guild else None
+            if ch and me:
+                perms = ch.permissions_for(me)
+                missing = []
+                if not perms.send_messages:   missing.append("Send Messages")
+                if not perms.embed_links:     missing.append("Embed Links")
+                if missing:
+                    await inter.followup.send(
+                        "I’m missing permissions in this channel: **"
+                        + ", ".join(missing) + "**.\n"
+                        "Please fix perms or run the command in a channel I can post to.",
+                        ephemeral=True
+                    )
+                    return
 
             now_utc   = datetime.now(timezone.utc)
             entry_end = now_utc + timedelta(seconds=entry_sec)
@@ -542,8 +565,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 value=f"Open for **{humanize_seconds(entry_sec)}**\nCloses {rel_ts(entry_end)}",
                 inline=True,
             )
-            # Show example voting duration so folks know the cadence
-            vote_preview_end = entry_end + timedelta(seconds=vote_sec)   # <-- starts after entries close
+            vote_preview_end = entry_end + timedelta(seconds=vote_sec)
             join_em.add_field(
                 name="Voting",
                 value=f"Each round runs **{humanize_seconds(vote_sec)}**\n"
@@ -551,30 +573,33 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 inline=True,
             )
 
-            # View + working Join button
-            view = discord.ui.View(timeout=None)
-            join_btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join")
+            # Send via follow-up (since we deferred)
+            sent = await inter.followup.send(embed=join_em, view=build_join_view(enabled=True), wait=True)
 
-            async def join_callback(btn_inter: discord.Interaction):
-                if btn_inter.user.bot:
-                    return
-                await btn_inter.response.send_modal(EntrantModal(btn_inter))
-
-            join_btn.callback = join_callback
-
-            # use helper so Join button can be toggled later
-            view = build_join_view(enabled=True)
-            
-            await inter.response.send_message(embed=join_em, view=view)
-            
-            # get the message we just sent
-            sent = await inter.original_response()
-            
             # Pin so it stays at the top during entries
             try:
                 await sent.pin(reason="Stylo: keep Join visible during entries")
             except Exception:
                 pass
+
+            # Store the message id so we can update/unpin later
+            con = db(); cur = con.cursor()
+            cur.execute("UPDATE event SET start_msg_id=? WHERE guild_id=?", (sent.id, inter.guild_id))
+            con.commit(); con.close()
+
+            # Start the countdown updater
+            asyncio.create_task(update_entry_embed_countdown(sent, entry_end, vote_sec))
+
+        except Exception as e:
+            # Log and surface a clean ephemeral error
+            import traceback, sys, textwrap
+            traceback.print_exc(file=sys.stderr)
+            msg = textwrap.shorten(f"Start failed: {e!r}", width=300)
+            try:
+                await inter.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+
             
             # Store the message id so we can update/unpin later
             con = db(); cur = con.cursor()
@@ -1251,17 +1276,41 @@ async def scheduler():
 
         # If only one winner -> champion
         if len(winners) == 1:
+            # winners list can contain either winner_id or tuples from earlier
+            raw = winners[0]
+            winner_id = raw[1] if isinstance(raw, tuple) else raw
+        
+            # close event
             cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
             con.commit()
-            # Announce champion
-            cur.execute("SELECT name FROM entrant WHERE id=?", (winners[0],)); champ = cur.fetchone()["name"]
+        
+            # fetch winner info (name, image, user)
+            cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (winner_id,))
+            w = cur.fetchone()
+            winner_name = (w["name"] if w and w["name"] else "Unknown")
+        
+            # try to resolve a proper mention
+            winner_mention = None
+            if w and guild:
+                mem = guild.get_member(w["user_id"])
+                if mem:
+                    winner_mention = mem.mention
+                elif w["user_id"]:
+                    winner_mention = f"<@{w['user_id']}>"
+        
+            em = discord.Embed(
+                title=f"👑 Stylo Champion — {ev['theme']}",
+                description=f"Winner by public vote: **{winner_name}**" + (f"\n{winner_mention}" if winner_mention else ""),
+                colour=discord.Colour.gold()
+            )
+            if w and w["image_url"]:
+                em.set_image(url=w["image_url"])
+        
             if ch:
-                await ch.send(embed=discord.Embed(
-                    title=f"👑 Stylo Champion — {ev['theme']}",
-                    description=f"Winner by public vote: **{champ}**",
-                    colour=discord.Colour.gold()
-                ))
+                await ch.send(embed=em)
+        
             continue
+
 
         # Otherwise set up next round
         # Build next entrants from winners (must have images already)
