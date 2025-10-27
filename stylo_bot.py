@@ -1282,7 +1282,7 @@ async def scheduler():
 
         # If only one winner -> champion
         if len(winners) == 1:
-            # winners list can contain either winner_id or tuples from earlier
+            # winners can be either a bare id or a tuple you appended earlier
             raw = winners[0]
             winner_id = raw[1] if isinstance(raw, tuple) else raw
         
@@ -1290,10 +1290,11 @@ async def scheduler():
             cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
             con.commit()
         
-            # fetch winner info (name, image, user)
+            # fetch winner info (need image_url!)
             cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (winner_id,))
             w = cur.fetchone()
             winner_name = (w["name"] if w and w["name"] else "Unknown")
+            winner_img  = (w["image_url"] if w and w["image_url"] else None)
         
             # try to resolve a proper mention
             winner_mention = None
@@ -1307,15 +1308,18 @@ async def scheduler():
             em = discord.Embed(
                 title=f"👑 Stylo Champion — {ev['theme']}",
                 description=f"Winner by public vote: **{winner_name}**" + (f"\n{winner_mention}" if winner_mention else ""),
-                colour=discord.Colour.gold()
+                colour=discord.Colour.gold(),
             )
-            if w and w["image_url"]:
-                em.set_image(url=w["image_url"])
+            if winner_img:
+                em.set_image(url=winner_img)
+            else:
+                print(f"[stylo] champion has no image_url (entrant {winner_id})")
         
             if ch:
                 await ch.send(embed=em)
         
             continue
+
 
 
         # Otherwise set up next round
