@@ -503,6 +503,9 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             await inter.response.defer(ephemeral=False)
         except discord.InteractionResponded:
             pass  # already deferred/answered somehow
+        #temporary to be deleted    
+        try:
+            print(f"[DEBUG StyloStartModal] theme={self.theme}, entry_hours={self.entry_hours}, vote_hours={self.vote_hours}")
 
         try:
             # Parse durations like "2", "2h", "90m", "1.5h"
@@ -513,6 +516,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             if not theme:
                 await inter.followup.send("Theme is required.", ephemeral=True)
                 return
+                
 
             # Basic channel permission sanity check (send+embed)
             ch = inter.channel
@@ -596,6 +600,8 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             traceback.print_exc(file=sys.stderr)
             msg = textwrap.shorten(f"Start failed: {e!r}", width=300)
             try:
+                print(f"[ERROR StyloStartModal] {type(e).__name__}: {e}")  #temporary to be deleted
+
                 await inter.followup.send(msg, ephemeral=True)
             except Exception:
                 pass
