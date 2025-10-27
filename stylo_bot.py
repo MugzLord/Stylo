@@ -493,15 +493,6 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         super().__init__()
         self._origin = inter
 
-    class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
-    theme = discord.ui.TextInput(label="Theme / Title", placeholder="Enchanted Garden", max_length=100)
-    entry_hours = discord.ui.TextInput(label="Entry window (hours)", default="24")
-    vote_hours = discord.ui.TextInput(label="Vote window per round (hours)", default="24")
-
-    def __init__(self, inter: discord.Interaction):
-        super().__init__()
-        self._origin = inter
-
     async def on_submit(self, inter: discord.Interaction):
         if not is_admin(inter.user):
             await inter.response.send_message("Admins only.", ephemeral=True)
