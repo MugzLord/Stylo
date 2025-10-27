@@ -1004,69 +1004,66 @@ async def scheduler():
                 matches = cur.fetchall()
                 # Post each match
                 for m in matches:
-                    if any_revote:
-                        # Keep event in 'voting' and push its round end to the latest match end.
-                        cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
-                                    (ev["guild_id"], ev["round_index"]))
-                        mx = cur.fetchone()["mx"]
-                        if mx:
-                            cur.execute("UPDATE event SET entry_end_utc=? WHERE guild_id=?", (mx, ev["guild_id"]))
-                            con.commit()
-                        # Don't unlock main chat or advance rounds; wait for tie re-votes to finish
-                        continue
-                    # Fetch entrants
-                    cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-                    cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-                
-                    # Prepare the embed regardless of image success
-                    em = discord.Embed(
-                        title=f"Round {new_round} — {L['name']} vs {R['name']}",
-                        description="Tap a button to vote. One vote per person.",
-                        colour=EMBED_COLOUR
-                    )
-                    em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                
-                    end_dt = vote_end  # already timezone-aware UTC
-                    view = MatchView(m["id"], end_dt, L["name"], R["name"])
-                
-                    msg = None
-                    try:
-                        # Try building the combined VS card image
-                        card = await build_vs_card(L["image_url"], R["image_url"])
-                        file = discord.File(fp=card, filename="versus.png")
-                        msg = await ch.send(embed=em, view=view, file=file)
-                    except Exception as e:
-                        # Log error but don't stop posting remaining matches
-                        print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-                        # Fallback: just post names + raw links
-                        em.add_field(
-                            name="Looks",
-                            value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
-                            inline=False
+                        # If we’re in the middle of tiebreaks, don’t advance/post
+                        if any_revote:
+                            cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                                        (ev["guild_id"], ev["round_index"]))
+                            mx = cur.fetchone()["mx"]        
+                            if mx:
+                                cur.execute("UPDATE event SET entry_end_utc=? WHERE guild_id=?", (mx, ev["guild_id"]))
+                                con.commit()
+                            continue
+                    
+                        # Fetch entrants
+                        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
+                        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
+                    
+                        # Base embed (works even if image fails)
+                        em = discord.Embed(
+                            title=f"Round {new_round} — {L['name']} vs {R['name']}",
+                            description="Tap a button to vote. One vote per person.",
+                            colour=EMBED_COLOUR
                         )
-                        msg = await ch.send(embed=em, view=view)
-                
-                    # Create a discussion thread
-                    thread_id = None
-                    try:
-                        thread = await msg.create_thread(
-                            name=f"💬 {L['name']} vs {R['name']} — Chat",
-                            auto_archive_duration=1440
-                        )
-                        await thread.send(embed=discord.Embed(
-                            title="Supporter Chat",
-                            description="Talk here! Votes are via buttons on the parent post above.",
-                            colour=discord.Colour.dark_grey()
-                        ))
-                        thread_id = thread.id
-                    except Exception as e:
-                        print(f"[stylo] Thread create failed for match {m['id']}: {e!r}")
+                        em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                    
+                        end_dt = vote_end  # timezone-aware UTC
+                        view = MatchView(m["id"], end_dt, L["name"], R["name"])
+                    
+                        # Try composite VS card; fall back if it fails
+                        try:
+                            card = await build_vs_card(L["image_url"], R["image_url"])
+                            file = discord.File(fp=card, filename="versus.png")
+                            msg = await ch.send(embed=em, view=view, file=file)
+                        except Exception as e:
+                            print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                            em.add_field(
+                                name="Looks",
+                                value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
+                                inline=False
+                            )
+                            msg = await ch.send(embed=em, view=view)
+                    
+                        # Thread for hype (best effort)
                         thread_id = None
-                
-                    # Save message + thread IDs
-                    cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
-                    con.commit()
-                    await asyncio.sleep(0.4)  # rate-limit friendly
+                        try:
+                            thread = await msg.create_thread(
+                                name=f"💬 {L['name']} vs {R['name']} — Chat",
+                                auto_archive_duration=1440
+                            )
+                            await thread.send(embed=discord.Embed(
+                                title="Supporter Chat",
+                                description="Talk here! Votes are via buttons on the parent post above.",
+                                colour=discord.Colour.dark_grey()
+                            ))
+                            thread_id = thread.id
+                        except Exception as e:
+                            print(f"[stylo] Thread create failed for match {m['id']}: {e!r}")
+                            thread_id = None
+                    
+                        cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
+                        con.commit()
+                        await asyncio.sleep(0.4)
+
                 
                 con.close()
 
