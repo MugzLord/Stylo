@@ -1014,7 +1014,6 @@ async def scheduler():
                             con.commit()
                         # Don't unlock main chat or advance rounds; wait for tie re-votes to finish
                         continue
-                
                     # Fetch entrants
                     cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                     cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
@@ -1394,67 +1393,6 @@ async def scheduler():
                             f"Main chat is locked; use each match thread for hype.",
                 colour=EMBED_COLOUR
             ))
-
-            
-            default = guild.default_role
-            try:
-                await ch.set_permissions(default, send_messages=False)
-            except Exception:
-                pass
-
-            cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
-                        (ev["guild_id"], new_round))
-            matches = cur.fetchall()
-            for m in matches:
-                if any_revote:
-                    # Keep event in 'voting' and push its round end to the latest match end.
-                    cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
-                                (ev["guild_id"], ev["round_index"]))
-                    mx = cur.fetchone()["mx"]
-                    if mx:
-                        cur.execute("UPDATE event SET entry_end_utc=? WHERE guild_id=?",
-                                    (mx, ev["guild_id"]))
-                        con.commit()
-                    # Don't unlock main chat or advance rounds; wait for tie re-votes to finish
-                    continue
-
-                cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-                cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-                card = await build_vs_card(L["image_url"], R["image_url"])
-                file = discord.File(fp=card, filename="versus.png")
-
-                em = discord.Embed(
-                    title=f"Round {new_round} — {L['name']} vs {R['name']}",
-                    description="Tap a button to vote. One vote per person.",
-                    colour=EMBED_COLOUR
-                )
-                em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-               
-                end_dt = vote_end  # already timezone-aware UTC
-                #em.set_footer(text=f"Voting ends {rel_ts(end_dt)}")
-                view = MatchView(m["id"], end_dt, L["name"], R["name"])
-                msg = await ch.send(embed=em, view=view, file=file)
-
-                # Thread
-                try:
-                    thread = await msg.create_thread(
-                        name=f"💬 {L['name']} vs {R['name']} — Chat",
-                        auto_archive_duration=1440
-                    )
-                    await thread.send(embed=discord.Embed(
-                        title="Supporter Chat",
-                        description="Talk here! Votes are via buttons on the parent post above.",
-                        colour=discord.Colour.dark_grey()
-                    ))
-                    thread_id = thread.id
-                except Exception:
-                    thread_id = None
-
-                cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
-                con.commit()
-                await asyncio.sleep(0.4)
-    con.close()
-
 @scheduler.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
