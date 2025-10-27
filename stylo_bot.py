@@ -1,3 +1,4 @@
+# stylo.py
 import os, io, math, asyncio, random, sqlite3, re
 from datetime import datetime, timedelta, timezone
 
@@ -7,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# -------------------- Config --------------------
+# --------- Config ---------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
@@ -22,7 +23,7 @@ INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
-# -------------------- DB helpers --------------------
+# --------- DB helpers ---------
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -39,10 +40,10 @@ def init_db():
         state            TEXT NOT NULL,          -- 'entry' | 'voting' | 'closed'
         entry_end_utc    TEXT NOT NULL,          -- ISO
         vote_hours       INTEGER NOT NULL,
+        vote_seconds     INTEGER,                -- prefers seconds if set
         round_index      INTEGER NOT NULL DEFAULT 0,
         main_channel_id  INTEGER,
-        start_msg_id     INTEGER,                -- pinned Join message id
-        vote_seconds     INTEGER                 -- exact per-round seconds (nullable -> fallback to hours)
+        start_msg_id     INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS entrant (
@@ -72,34 +73,23 @@ def init_db():
         end_utc     TEXT,
         left_votes  INTEGER NOT NULL DEFAULT 0,
         right_votes INTEGER NOT NULL DEFAULT 0,
-        winner_id   INTEGER,
-        FOREIGN KEY(left_id)  REFERENCES entrant(id),
-        FOREIGN KEY(right_id) REFERENCES entrant(id)
+        winner_id   INTEGER
     );
 
-    CREATE TABLE IF NOT EXISTS guild_settings (
-        guild_id           INTEGER PRIMARY KEY,
-        log_channel_id     INTEGER,
-        ticket_category_id INTEGER
+    -- ✅ Missing before: this makes vote buttons actually work.
+    CREATE TABLE IF NOT EXISTS voter (
+        match_id  INTEGER NOT NULL,
+        user_id   INTEGER NOT NULL,
+        side      TEXT NOT NULL,  -- 'L' or 'R'
+        PRIMARY KEY (match_id, user_id),
+        FOREIGN KEY(match_id) REFERENCES match(id) ON DELETE CASCADE
     );
     """)
     con.commit(); con.close()
 
-def migrate_db():
-    # make sure columns exist (idempotent)
-    con = db(); cur = con.cursor()
-    cur.execute("PRAGMA table_info(event)")
-    cols = {r["name"] for r in cur.fetchall()}
-    if "vote_seconds" not in cols:
-        cur.execute("ALTER TABLE event ADD COLUMN vote_seconds INTEGER")
-    if "start_msg_id" not in cols:
-        cur.execute("ALTER TABLE event ADD COLUMN start_msg_id INTEGER")
-    con.commit(); con.close()
-
 init_db()
-migrate_db()
 
-# -------------------- Small utils --------------------
+# --------- Utils ---------
 def rel_ts(dt_utc: datetime) -> str:
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
@@ -109,60 +99,71 @@ def rel_ts(dt_utc: datetime) -> str:
 
 def humanize_seconds(sec: int) -> str:
     m = round(sec / 60)
-    if m % 60 == 0:
-        return f"{m//60}h"
-    return f"{m}m"
+    return f"{m//60}h" if m % 60 == 0 else f"{m}m"
 
 def parse_duration_to_seconds(text: str, default_unit="h") -> int:
     s = (text or "").strip().lower().replace(" ", "")
     m = re.match(r"^([0-9]*\.?[0-9]+)([mh])?$", s)
-    if not m:
-        raise ValueError("invalid duration")
+    if not m: raise ValueError("invalid duration")
     val = float(m.group(1))
     unit = m.group(2) or default_unit
     minutes = val * (60 if unit == "h" else 1)
     seconds = int(round(minutes * 60))
-    return max(60, min(seconds, 60 * 60 * 24 * 10))
+    return max(60, min(seconds, 60*60*24*10))  # 1m .. 10d
 
-def is_admin(user: discord.Member) -> bool:
-    return user.guild_permissions.manage_guild or user.guild_permissions.administrator
+def is_admin(member: discord.Member) -> bool:
+    return member.guild_permissions.manage_guild or member.guild_permissions.administrator
 
-def get_ticket_category_id(guild_id: int) -> int | None:
+async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
+    """Delete all Stylo entry ticket channels for this guild and clear DB rows."""
+    if not guild: return
     con = db(); cur = con.cursor()
-    cur.execute("SELECT ticket_category_id FROM guild_settings WHERE guild_id=?", (guild_id,))
-    row = cur.fetchone(); con.close()
-    return (row["ticket_category_id"] if row and row["ticket_category_id"] else None)
-
-def set_ticket_category_id(guild_id: int, category_id: int | None):
-    con = db(); cur = con.cursor()
-    if category_id is None:
-        cur.execute("UPDATE guild_settings SET ticket_category_id=NULL WHERE guild_id=?", (guild_id,))
-    else:
+    try:
         cur.execute(
-            "INSERT INTO guild_settings(guild_id, ticket_category_id) VALUES(?,?) "
-            "ON CONFLICT(guild_id) DO UPDATE SET ticket_category_id=excluded.ticket_category_id",
-            (guild_id, category_id)
+            "SELECT t.channel_id FROM ticket t JOIN entrant e ON e.id=t.entrant_id WHERE e.guild_id=?",
+            (guild.id,)
         )
-    con.commit(); con.close()
+        rows = cur.fetchall()
+        for r in rows:
+            ch = guild.get_channel(r["channel_id"])
+            if ch:
+                try:    await ch.delete(reason=reason)
+                except: pass
+                await asyncio.sleep(0.25)
+        cur.execute("DELETE FROM ticket WHERE entrant_id IN (SELECT id FROM entrant WHERE guild_id=?)", (guild.id,))
+        con.commit()
+    finally:
+        con.close()
 
-def get_log_channel_id(guild_id: int) -> int | None:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", (guild_id,))
-    row = cur.fetchone(); con.close()
-    return (row["log_channel_id"] if row and row["log_channel_id"] else None)
+# --------- Optional nice vs-card (with robust fallback) ---------
+async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(left_url) as r1: Lb = await r1.read()
+        async with sess.get(right_url) as r2: Rb = await r2.read()
+    L = Image.open(io.BytesIO(Lb)).convert("RGB")
+    R = Image.open(io.BytesIO(Rb)).convert("RGB")
+    tile_w = (width - gap) // 2
+    max_h_guess = int(tile_w * 2.0)
+    Lc = ImageOps.contain(L, (tile_w, max_h_guess), method=Image.LANCZOS)
+    Rc = ImageOps.contain(R, (tile_w, max_h_guess), method=Image.LANCZOS)
+    target_h = max(Lc.height, Rc.height)
 
-def set_log_channel_id(guild_id: int, channel_id: int | None):
-    con = db(); cur = con.cursor()
-    if channel_id is None:
-        cur.execute("UPDATE guild_settings SET log_channel_id=NULL WHERE guild_id=?", (guild_id,))
-    else:
-        cur.execute(
-            "INSERT INTO guild_settings(guild_id, log_channel_id) VALUES(?,?) "
-            "ON CONFLICT(guild_id) DO UPDATE SET log_channel_id=excluded.log_channel_id",
-            (guild_id, channel_id)
-        )
-    con.commit(); con.close()
+    def make_tile(img):
+        tile = Image.new("RGB", (tile_w, target_h), (20, 20, 30))
+        tile.paste(img, ((tile_w - img.width)//2, (target_h - img.height)//2))
+        return tile
 
+    canvas = Image.new("RGB", (width, target_h), (20, 20, 30))
+    canvas.paste(make_tile(Lc), (0, 0))
+    canvas.paste(make_tile(Rc), (tile_w + gap, 0))
+    ImageDraw.Draw(canvas).rectangle([tile_w, 0, tile_w + gap, target_h], fill=(45,45,60))
+
+    out = io.BytesIO()
+    canvas.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    return out
+
+# --------- Join Button ---------
 def build_join_view(enabled: bool = True) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join", disabled=not enabled)
@@ -173,61 +174,7 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
     view.add_item(btn)
     return view
 
-async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str = "Stylo: entries closed"):
-    if not guild:
-        return
-    con = db(); cur = con.cursor()
-    try:
-        cur.execute(
-            "SELECT t.channel_id FROM ticket t JOIN entrant e ON e.id = t.entrant_id WHERE e.guild_id=?",
-            (guild.id,)
-        )
-        rows = cur.fetchall()
-        for r in rows:
-            ch = guild.get_channel(r["channel_id"])
-            if ch:
-                try:    await ch.delete(reason=reason)
-                except: pass
-                await asyncio.sleep(0.3)
-        cur.execute("DELETE FROM ticket WHERE entrant_id IN (SELECT id FROM entrant WHERE guild_id=?)", (guild.id,))
-        con.commit()
-    finally:
-        con.close()
-
-# -------------------- VS-card (nice-to-have) --------------------
-async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(left_url) as r1: Lb = await r1.read()
-        async with sess.get(right_url) as r2: Rb = await r2.read()
-    L = Image.open(io.BytesIO(Lb)).convert("RGB")
-    R = Image.open(io.BytesIO(Rb)).convert("RGB")
-
-    tile_w = (width - gap) // 2
-    max_h_guess = int(tile_w * 2.0)
-    Lc = ImageOps.contain(L, (tile_w, max_h_guess), method=Image.LANCZOS)
-    Rc = ImageOps.contain(R, (tile_w, max_h_guess), method=Image.LANCZOS)
-    target_h = max(Lc.height, Rc.height)
-
-    def make_tile(img):
-        tile = Image.new("RGB", (tile_w, target_h), (20, 20, 30))
-        x = (tile_w - img.width) // 2
-        y = (target_h - img.height) // 2
-        tile.paste(img, (x, y))
-        return tile
-
-    canvas = Image.new("RGB", (width, target_h), (20, 20, 30))
-    canvas.paste(make_tile(Lc), (0, 0))
-    canvas.paste(make_tile(Rc), (tile_w + gap, 0))
-
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle([tile_w, 0, tile_w + gap, target_h], fill=(45, 45, 60))
-
-    out = io.BytesIO()
-    canvas.save(out, format="PNG", optimize=True)
-    out.seek(0)
-    return out
-
-# -------------------- Views --------------------
+# --------- Voting UI ---------
 class MatchView(discord.ui.View):
     def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str):
         timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
@@ -237,35 +184,48 @@ class MatchView(discord.ui.View):
         self.btn_right.label = f"Vote {right_label}"
 
     async def _vote(self, interaction: discord.Interaction, side: str):
-        con = db(); cur = con.cursor()
-        cur.execute("SELECT left_votes, right_votes, end_utc FROM match WHERE id=?", (self.match_id,))
-        row = cur.fetchone()
-        if not row:
-            await interaction.response.send_message("Match not found.", ephemeral=True); con.close(); return
-        end_dt = datetime.fromisoformat(row["end_utc"]).replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) >= end_dt:
-            await interaction.response.send_message("Voting has ended for this match.", ephemeral=True); con.close(); return
-
+        # DB safety so errors don't kill the UI
         try:
-            cur.execute("INSERT INTO voter(match_id, user_id, side) VALUES(?,?,?)", (self.match_id, interaction.user.id, side))
-        except sqlite3.IntegrityError:
-            await interaction.response.send_message("You’ve already voted for this match. 👍", ephemeral=True)
-            con.close(); return
+            con = db(); cur = con.cursor()
+            cur.execute("SELECT left_votes, right_votes, end_utc FROM match WHERE id=?", (self.match_id,))
+            row = cur.fetchone()
+            if not row:
+                await interaction.response.send_message("Match not found.", ephemeral=True); return
+            end_dt = datetime.fromisoformat(row["end_utc"]).replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= end_dt:
+                await interaction.response.send_message("Voting has ended for this match.", ephemeral=True); return
 
-        if side == "L":
-            cur.execute("UPDATE match SET left_votes = left_votes + 1 WHERE id=?", (self.match_id,))
-        else:
-            cur.execute("UPDATE match SET right_votes = right_votes + 1 WHERE id=?", (self.match_id,))
-        con.commit()
+            try:
+                cur.execute("INSERT INTO voter(match_id, user_id, side) VALUES(?,?,?)",
+                            (self.match_id, interaction.user.id, side))
+            except sqlite3.IntegrityError:
+                await interaction.response.send_message("You’ve already voted for this match. 👍", ephemeral=True)
+                return
 
-        cur.execute("SELECT left_votes, right_votes FROM match WHERE id=?", (self.match_id,))
-        m = cur.fetchone(); con.close()
-        L, R = m["left_votes"], m["right_votes"]
-        total = L + R
-        pa = math.floor((L / total) * 100) if total else 0
-        pb = 100 - pa if total else 0
+            if side == "L":
+                cur.execute("UPDATE match SET left_votes = left_votes + 1 WHERE id=?", (self.match_id,))
+            else:
+                cur.execute("UPDATE match SET right_votes = right_votes + 1 WHERE id=?", (self.match_id,))
+            con.commit()
 
-        # live update
+            cur.execute("SELECT left_votes, right_votes FROM match WHERE id=?", (self.match_id,))
+            m = cur.fetchone()
+            L, R = m["left_votes"], m["right_votes"]
+            total = L + R
+            pa = math.floor((L / total) * 100) if total else 0
+            pb = 100 - pa if total else 0
+        except Exception as e:
+            print(f"[stylo] vote error: {e!r}")
+            try:
+                await interaction.response.send_message("Voting error — please try again.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        finally:
+            try: con.close()
+            except: pass
+
+        # live totals update
         if interaction.message and interaction.message.embeds:
             em = interaction.message.embeds[0]
             if em.fields:
@@ -291,43 +251,11 @@ class MatchView(discord.ui.View):
             if isinstance(c, discord.ui.Button):
                 c.disabled = True
 
-# -------------------- Settings group --------------------
-settings_group = app_commands.Group(name="stylo_settings", description="Configure Stylo per server")
-
-@settings_group.command(name="set_log_channel")
-@app_commands.describe(channel="Pick a text channel")
-async def stylo_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
-    if not is_admin(inter.user):
-        await inter.response.send_message("Admins only.", ephemeral=True); return
-    set_log_channel_id(inter.guild_id, channel.id)
-    await inter.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
-
-@settings_group.command(name="set_ticket_category")
-@app_commands.describe(category="Category where entry tickets will be created")
-async def stylo_set_ticket_category(inter: discord.Interaction, category: discord.CategoryChannel):
-    if not is_admin(inter.user):
-        await inter.response.send_message("Admins only.", ephemeral=True); return
-    set_ticket_category_id(inter.guild_id, category.id)
-    await inter.response.send_message(f"✅ Ticket category set to **{category.name}**", ephemeral=True)
-
-@settings_group.command(name="show")
-async def stylo_show_settings(inter: discord.Interaction):
-    if not is_admin(inter.user):
-        await inter.response.send_message("Admins only.", ephemeral=True); return
-    ch_id = get_log_channel_id(inter.guild_id)
-    cat_id = get_ticket_category_id(inter.guild_id)
-    em = discord.Embed(title="Stylo Settings", colour=EMBED_COLOUR)
-    em.add_field(name="Log channel", value=(f"<#{ch_id}>" if ch_id else "— not set —"), inline=False)
-    em.add_field(name="Ticket category", value=(f"<#{cat_id}>" if cat_id else "— not set —"), inline=False)
-    await inter.response.send_message(embed=em, ephemeral=True)
-
-bot.tree.add_command(settings_group)
-
-# -------------------- Modals --------------------
+# --------- Start Modal ---------
 class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
     theme = discord.ui.TextInput(label="Theme / Title", placeholder="Enchanted Garden", max_length=100)
     entry_hours = discord.ui.TextInput(label="Entry window (hours)", default="24")
-    vote_hours = discord.ui.TextInput(label="Vote window per round (hours)", default="24")
+    vote_hours  = discord.ui.TextInput(label="Vote window per round (hours)", default="24")
 
     def __init__(self, inter: discord.Interaction):
         super().__init__(); self._origin = inter
@@ -336,26 +264,14 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         if not is_admin(inter.user):
             await inter.response.send_message("Admins only.", ephemeral=True); return
         try:
-            try:
-                await inter.response.defer(ephemeral=False)
-            except discord.InteractionResponded:
-                pass
+            try: await inter.response.defer(ephemeral=False)
+            except discord.InteractionResponded: pass
 
             entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
             vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
             theme = str(self.theme).strip()
             if not theme:
                 await inter.followup.send("Theme is required.", ephemeral=True); return
-
-            ch = inter.channel; me = inter.guild.me if inter.guild else None
-            if ch and me:
-                perms = ch.permissions_for(me)
-                missing = []
-                if not perms.send_messages: missing.append("Send Messages")
-                if not perms.embed_links:   missing.append("Embed Links")
-                if missing:
-                    await inter.followup.send("I’m missing: **" + ", ".join(missing) + "** here.", ephemeral=True)
-                    return
 
             now_utc = datetime.now(timezone.utc)
             entry_end = now_utc + timedelta(seconds=entry_sec)
@@ -369,28 +285,28 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             )
             con.commit(); con.close()
 
-            join_em = discord.Embed(
+            em = discord.Embed(
                 title=f"✨ Stylo: {theme}",
                 description=("Entries are now **open**!\n"
                              "Hit **Join** to submit your look. Your final image (square) must be posted in your ticket before entries close."),
-                colour=EMBED_COLOUR,
+                colour=EMBED_COLOUR
             )
-            join_em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**\nCloses {rel_ts(entry_end)}", inline=True)
-            join_em.add_field(name="Voting", value=f"Each round runs **{humanize_seconds(vote_sec)}**\nRound 1 closes {rel_ts(entry_end + timedelta(seconds=vote_sec))}", inline=True)
+            em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**\nCloses {rel_ts(entry_end)}", inline=True)
+            em.add_field(name="Voting",  value=f"Each round runs **{humanize_seconds(vote_sec)}**\nRound 1 closes {rel_ts(entry_end + timedelta(seconds=vote_sec))}", inline=True)
 
-            sent = await inter.followup.send(embed=join_em, view=build_join_view(True), wait=True)
+            sent = await inter.followup.send(embed=em, view=build_join_view(True), wait=True)
             try: await sent.pin(reason="Stylo: keep Join visible during entries")
             except: pass
 
             con = db(); cur = con.cursor()
             cur.execute("UPDATE event SET start_msg_id=? WHERE guild_id=?", (sent.id, inter.guild_id))
             con.commit(); con.close()
-
         except Exception as e:
             import traceback, sys, textwrap
             traceback.print_exc(file=sys.stderr)
             await inter.followup.send(textwrap.shorten(f"Start failed: {e!r}", width=300), ephemeral=True)
 
+# --------- Join Modal ---------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
     display_name = discord.ui.TextInput(label="Display name / alias", placeholder="MikeyMoon / Mike", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
@@ -408,8 +324,8 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             if not ev or ev["state"] != "entry":
                 con.close(); await inter.response.send_message("Entries are not open.", ephemeral=True); return
 
-            # hard stop if elapsed
-            if datetime.now(timezone.utc) >= datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc):
+            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= entry_end:
                 con.close(); await inter.response.send_message("Entries have just closed.", ephemeral=True); return
 
             name = str(self.display_name).strip()
@@ -435,28 +351,8 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                 else:
                     cur.execute("DELETE FROM ticket WHERE entrant_id=?", (entrant_id,)); con.commit()
 
+            # create a private ticket at guild root
             guild = inter.guild
-            category = None
-            cat_id = get_ticket_category_id(guild.id)
-            if cat_id:
-                maybe = guild.get_channel(cat_id)
-                if isinstance(maybe, discord.CategoryChannel):
-                    perms = maybe.permissions_for(guild.me)
-                    if not (perms.view_channel and perms.manage_channels):
-                        missing = []
-                        if not perms.view_channel: missing.append("View Channel (category)")
-                        if not perms.manage_channels: missing.append("Manage Channels (category)")
-                        con.close()
-                        await inter.response.send_message(
-                            "I can’t create your ticket in the selected category — missing: **"
-                            + ", ".join(missing) + "**.\nSet a new one with `/stylo_settings set_ticket_category`.",
-                            ephemeral=True
-                        ); return
-                    if len(maybe.channels) >= 50:
-                        con.close()
-                        await inter.response.send_message("The ticket category is full (50). Choose another.", ephemeral=True); return
-                    category = maybe
-
             default = guild.default_role
             admin_roles = [r for r in guild.roles if r.permissions.administrator]
             overwrites = {
@@ -469,19 +365,18 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 
             ticket_name = f"stylo-entry-{inter.user.name}".lower()[:90]
             try:
-                ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket", category=category)
+                ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket")
             except discord.Forbidden:
-                ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket (fallback)")
+                await inter.response.send_message("I can't create a ticket here (permissions).", ephemeral=True); return
 
             cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
             con.commit(); con.close()
 
             info = discord.Embed(
                 title="📸 Submit your outfit image",
-                description=("Please upload **one** image for your entry in this channel.\n"
-                             "• **Must be square (1:1)**\n"
-                             "You may re-upload to replace it; your **latest image** before entries close is used.\n"
-                             "This channel will be automatically deleted when voting starts."),
+                description=("Upload **one** square (1:1) image here.\n"
+                             "You can re-upload to replace it—your **latest image** before entries close is used.\n"
+                             "This channel will be deleted automatically when voting starts."),
                 colour=EMBED_COLOUR
             )
             await ticket.send(content=inter.user.mention, embed=info)
@@ -495,13 +390,12 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             except discord.InteractionResponded:
                 await inter.followup.send(textwrap.shorten(f"Join failed: {e!r}", width=300), ephemeral=True)
 
-# -------------------- Capture ticket image --------------------
+# --------- Capture image inside ticket ---------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # Is this a Stylo ticket channel?
     con = db(); cur = con.cursor()
     cur.execute(
         "SELECT entrant.id AS entrant_id, entrant.user_id "
@@ -512,10 +406,9 @@ async def on_message(message: discord.Message):
     row = cur.fetchone()
     if not row:
         con.close()
-        await bot.process_commands(message)   # keep other commands working
+        await bot.process_commands(message)
         return
 
-    # Only accept the entrant's uploads
     if message.author.id != row["user_id"] or not message.attachments:
         con.close()
         await bot.process_commands(message)
@@ -543,14 +436,14 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Commands --------------------
+# --------- Commands ---------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
 async def stylo_cmd(inter: discord.Interaction):
     if not is_admin(inter.user):
         await inter.response.send_message("Admins only.", ephemeral=True); return
     await inter.response.send_modal(StyloStartModal(inter))
 
-@bot.tree.command(name="stylo_debug", description="Show Stylo status for this server (admin only).")
+@bot.tree.command(name="stylo_debug", description="Show Stylo status (admin only).")
 async def stylo_debug(inter: discord.Interaction):
     if not is_admin(inter.user):
         await inter.response.send_message("Admins only.", ephemeral=True); return
@@ -558,15 +451,12 @@ async def stylo_debug(inter: discord.Interaction):
     con = db(); cur = con.cursor()
     cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
     ev = cur.fetchone()
-
     if not ev:
-        con.close()
-        await inter.response.send_message("No active event found.", ephemeral=True)
-        return
+        con.close(); await inter.response.send_message("No active event.", ephemeral=True); return
 
     cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (inter.guild_id,))
     total_entrants = cur.fetchone()["c"] or 0
-    cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=? AND image_url IS NOT NULL", (inter.guild_id,))
+    cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''", (inter.guild_id,))
     with_image = cur.fetchone()["c"] or 0
     cur.execute("SELECT COUNT(*) AS c FROM match WHERE guild_id=? AND round_index=?", (inter.guild_id, ev["round_index"]))
     matches_in_round = cur.fetchone()["c"] or 0
@@ -575,27 +465,16 @@ async def stylo_debug(inter: discord.Interaction):
     entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
 
     con.close()
-
     msg = (
         f"**Event state:** `{ev['state']}`  |  **Round:** `{ev['round_index']}`\n"
         f"**Entrants (total):** {total_entrants}\n"
         f"**Entrants with image:** {with_image}\n"
         f"**Matches in this round:** {matches_in_round}\n"
-        f"**Entry end (UTC):** {entry_end.isoformat()}  |  **Now:** {now.isoformat()}\n\n"
+        f"**Entry end (UTC):** {entry_end.isoformat()}  |  **Now:** {now.isoformat()}\n"
     )
-
-    if ev["state"] == "entry" and with_image >= 2 and now >= entry_end:
-        msg += "➡️ Entries ended and there are at least 2 images. Scheduler should create pairs on its next tick."
-    elif ev["state"] == "entry" and with_image < 2 and now >= entry_end:
-        msg += "⛔ Entries ended but fewer than 2 images were saved — no pairs can be created."
-    elif ev["state"] == "voting" and matches_in_round == 0:
-        msg += "⚠️ State is 'voting' but no matches exist; something blocked pair creation."
-    else:
-        msg += "ℹ️ Status looks consistent."
-
     await inter.response.send_message(msg, ephemeral=True)
 
-# -------------------- Scheduler --------------------
+# --------- Scheduler ---------
 @tasks.loop(seconds=20)
 async def scheduler():
     now = datetime.now(timezone.utc)
@@ -609,9 +488,13 @@ async def scheduler():
             if now < entry_end:
                 continue
 
-            # entrants with image saved
-            cur.execute("SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL", (ev["guild_id"],))
+            # only entrants with a real image url
+            cur.execute(
+                "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
+                (ev["guild_id"],)
+            )
             entrants = cur.fetchall()
+
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
 
@@ -625,7 +508,7 @@ async def scheduler():
                     try:
                         await ch.send(embed=discord.Embed(
                             title="⛔ Stylo cancelled",
-                            description="Entries closed with fewer than two valid images. No bracket could be created.",
+                            description="Entries closed with fewer than two valid images.",
                             colour=discord.Colour.red()
                         ))
                     except: pass
@@ -636,7 +519,6 @@ async def scheduler():
             for i in range(0, len(entrants), 2):
                 if i + 1 < len(entrants):
                     pairs.append((entrants[i], entrants[i + 1]))
-            byes = entrants[-1:] if (len(entrants) % 2 == 1) else []
 
             round_index = 1
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
@@ -660,20 +542,20 @@ async def scheduler():
                 try:
                     start_msg = await ch.fetch_message(ev["start_msg_id"])
                     if start_msg and start_msg.embeds:
-                        em = start_msg.embeds[0]
-                        if em.fields:
-                            em.set_field_at(0, name="Entries", value="**Closed**", inline=True)
-                        await start_msg.edit(embed=em, view=build_join_view(False))
+                        je = start_msg.embeds[0]
+                        if je.fields:
+                            je.set_field_at(0, name="Entries", value="**Closed**", inline=True)
+                        await start_msg.edit(embed=je, view=build_join_view(False))
                     try: await start_msg.unpin(reason="Stylo: entries closed")
                     except: pass
                 except: pass
 
-            # ALWAYS delete tickets once voting starts
+            # delete all tickets
             if guild:
                 try: await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
                 except: pass
 
-            # Announce + lock main chat
+            # announce + lock
             if ch:
                 try:
                     await ch.send(embed=discord.Embed(
@@ -686,7 +568,7 @@ async def scheduler():
                     except: pass
                 except: pass
 
-                # Post ALL matches (robust; 5+ supported)
+                # post ALL matches
                 cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
                             (ev["guild_id"], round_index))
                 matches = cur.fetchall()
@@ -706,18 +588,21 @@ async def scheduler():
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
 
                         try:
-                            card = await build_vs_card(L["image_url"], R["image_url"])
+                            card = await build_vs_card((L["image_url"] or "").strip(), (R["image_url"] or "").strip())
                             file = discord.File(fp=card, filename="versus.png")
                             msg = await ch.send(embed=em, view=view, file=file)
                         except Exception:
-                            # Fallback: show both images as embeds so people can actually see
+                            # fallback: show both images so voters can actually see
                             em_left  = discord.Embed(title=L["name"], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R["name"], colour=discord.Colour.dark_grey())
-                            if L["image_url"]: em_left.set_image(url=L["image_url"])
-                            if R["image_url"]: em_right.set_image(url=R["image_url"])
+                            Lurl = (L["image_url"] or "").strip(); Rurl = (R["image_url"] or "").strip()
+                            if Lurl: em_left.set_image(url=Lurl)
+                            else:    em_left.description = "No image saved."
+                            if Rurl: em_right.set_image(url=Rurl)
+                            else:    em_right.description = "No image saved."
                             msg = await ch.send(embeds=[em, em_left, em_right], view=view)
 
-                        # Thread (best-effort)
+                        # thread (best-effort)
                         thread_id = None
                         try:
                             thread = await msg.create_thread(
@@ -743,7 +628,7 @@ async def scheduler():
         print(f"[stylo] ERROR entry->voting: {e!r}")
         traceback.print_exc(file=sys.stderr)
 
-    # VOTING END -> RESULTS / NEXT ROUND
+    # VOTING END -> RESULTS / NEXT ROUND / CHAMPION
     try:
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='voting'")
@@ -771,7 +656,6 @@ async def scheduler():
                 if L == R:
                     any_revote = True
                     new_end = now + timedelta(seconds=vote_sec)
-
                     cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
                                 (new_end.isoformat(), m["id"]))
                     cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
@@ -786,9 +670,7 @@ async def scheduler():
                                 colour=EMBED_COLOUR
                             )
                             if em.fields:
-                                em.set_field_at(0, name="Live totals",
-                                                value="Total votes: **0**\nSplit: **0% / 0%**",
-                                                inline=False)
+                                em.set_field_at(0, name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                             else:
                                 em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                             view = MatchView(m["id"], new_end, LN, RN)
@@ -803,7 +685,6 @@ async def scheduler():
                                 colour=discord.Colour.orange()
                             ))
                         except: pass
-
                     continue
 
                 # normal winner
@@ -827,8 +708,8 @@ async def scheduler():
                             description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n🏆 **Winner:** {winner_mention}",
                             colour=discord.Colour.green()
                         )
-                        # round results use thumbnail only
-                        if wrow and wrow["image_url"]:
+                        # round result uses thumbnail only
+                        if wrow and (wrow["image_url"] or "").strip():
                             em.set_thumbnail(url=wrow["image_url"])
                         await ch.send(embed=em)
                     except: pass
@@ -843,12 +724,12 @@ async def scheduler():
                     con.commit()
                 continue
 
-            # unlock chat
+            # unlock main chat
             if ch and guild:
                 try: await ch.set_permissions(guild.default_role, send_messages=True)
                 except: pass
 
-            # Champion?
+            # CHAMPION?
             if len(winners) == 1:
                 champ_id = winners[0][1]
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
@@ -862,13 +743,13 @@ async def scheduler():
                     description=f"Winner by public vote: **{winner_name}**" + (f"\n<@{w['user_id']}>" if w and w["user_id"] else ""),
                     colour=discord.Colour.gold()
                 )
-                if w and w["image_url"]:
-                    em.set_image(url=w["image_url"])   # full-size for Champion
+                if w and (w["image_url"] or "").strip():
+                    em.set_image(url=w["image_url"])  # full-size for champion
                 if ch:
                     await ch.send(embed=em)
                 continue
 
-            # Next round: build from winners (all pairs, any count)
+            # NEXT ROUND from winners
             winner_ids = [w[1] for w in winners]
             placeholders = ",".join("?" for _ in winner_ids)
             cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
@@ -912,7 +793,7 @@ async def scheduler():
 async def _wait_ready():
     await bot.wait_until_ready()
 
-# -------------------- Ready --------------------
+# --------- Ready ---------
 @bot.event
 async def on_ready():
     try:
@@ -922,12 +803,7 @@ async def on_ready():
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    log_id = int(os.getenv("LOG_CHANNEL_ID", "0"))
-    if log_id:
-        ch = bot.get_channel(log_id)
-        if ch:
-            await ch.send("✨ Stylo is online with pairing, ticket cleanup, tie revotes, and champion image fixes.")
 
-# -------------------- Run --------------------
+# --------- Run ---------
 if __name__ == "__main__":
     bot.run(TOKEN)
