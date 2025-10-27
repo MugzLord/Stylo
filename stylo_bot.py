@@ -493,22 +493,27 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         super().__init__()
         self._origin = inter
 
+    class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
+    theme = discord.ui.TextInput(label="Theme / Title", placeholder="Enchanted Garden", max_length=100)
+    entry_hours = discord.ui.TextInput(label="Entry window (hours)", default="24")
+    vote_hours = discord.ui.TextInput(label="Vote window per round (hours)", default="24")
+
+    def __init__(self, inter: discord.Interaction):
+        super().__init__()
+        self._origin = inter
+
     async def on_submit(self, inter: discord.Interaction):
         if not is_admin(inter.user):
             await inter.response.send_message("Admins only.", ephemeral=True)
             return
 
-        # Defer immediately so Discord doesn't time out the modal submit
+        # Prevent modal timeout
         try:
             await inter.response.defer(ephemeral=False)
         except discord.InteractionResponded:
-            pass  # already deferred/answered somehow
-        #temporary to be deleted    
-        try:
-            print(f"[DEBUG StyloStartModal] theme={self.theme}, entry_hours={self.entry_hours}, vote_hours={self.vote_hours}")
+            pass
 
         try:
-            # Parse durations like "2", "2h", "90m", "1.5h"
             entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
             vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
 
@@ -516,21 +521,18 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             if not theme:
                 await inter.followup.send("Theme is required.", ephemeral=True)
                 return
-                
 
-            # Basic channel permission sanity check (send+embed)
+            # Permission sanity check in current channel
             ch = inter.channel
             me = inter.guild.me if inter.guild else None
             if ch and me:
                 perms = ch.permissions_for(me)
                 missing = []
-                if not perms.send_messages:   missing.append("Send Messages")
-                if not perms.embed_links:     missing.append("Embed Links")
+                if not perms.send_messages: missing.append("Send Messages")
+                if not perms.embed_links:   missing.append("Embed Links")
                 if missing:
                     await inter.followup.send(
-                        "I’m missing permissions in this channel: **"
-                        + ", ".join(missing) + "**.\n"
-                        "Please fix perms or run the command in a channel I can post to.",
+                        "I’m missing: **" + ", ".join(missing) + "** in this channel.",
                         ephemeral=True
                     )
                     return
@@ -543,24 +545,20 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
                 "REPLACE INTO event(guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id) "
                 "VALUES(?,?,?,?,?,?,?,?)",
                 (
-                    inter.guild_id,
-                    theme,
-                    "entry",
+                    inter.guild_id, theme, "entry",
                     entry_end.isoformat(),
-                    int(round(vote_sec/3600)),
-                    int(vote_sec),
-                    0,
-                    inter.channel_id,
+                    int(round(vote_sec/3600)), int(vote_sec),
+                    0, inter.channel_id,
                 ),
             )
             con.commit(); con.close()
 
-            # Build the Join embed (with countdowns)
+            # Build join embed
             join_em = discord.Embed(
                 title=f"✨ Stylo: {theme}",
                 description=(
                     "Entries are now **open**!\n"
-                    "Press **Join** to submit your look. Your final image (square size) must be posted in your ticket before entries close."
+                    "Press **Join** to submit your look. Your final image (square) must be posted in your ticket before entries close."
                 ),
                 colour=EMBED_COLOUR,
             )
@@ -572,19 +570,32 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             vote_preview_end = entry_end + timedelta(seconds=vote_sec)
             join_em.add_field(
                 name="Voting",
-                value=f"Each round runs **{humanize_seconds(vote_sec)}**\n"
-                      f"Round 1 closes {rel_ts(vote_preview_end)}",
+                value=f"Each round runs **{humanize_seconds(vote_sec)}**\nRound 1 closes {rel_ts(vote_preview_end)}",
                 inline=True,
             )
 
-            # Send via follow-up (since we deferred)
             sent = await inter.followup.send(embed=join_em, view=build_join_view(enabled=True), wait=True)
 
-            # Pin so it stays at the top during entries
             try:
                 await sent.pin(reason="Stylo: keep Join visible during entries")
             except Exception:
                 pass
+
+            con = db(); cur = con.cursor()
+            cur.execute("UPDATE event SET start_msg_id=? WHERE guild_id=?", (sent.id, inter.guild_id))
+            con.commit(); con.close()
+
+            asyncio.create_task(update_entry_embed_countdown(sent, entry_end, vote_sec))
+
+        except Exception as e:
+            import traceback, sys, textwrap
+            traceback.print_exc(file=sys.stderr)
+            msg = textwrap.shorten(f"Start failed: {e!r}", width=300)
+            try:
+                await inter.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+
 
             # Store the message id so we can update/unpin later
             con = db(); cur = con.cursor()
