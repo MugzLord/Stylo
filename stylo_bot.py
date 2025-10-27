@@ -8,12 +8,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# --------- Config ---------
+# ---------------- Config ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
-DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
+DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")  # uses 'stylo.db' unless you set STYLO_DB_PATH
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
 INTENTS = discord.Intents.default()
@@ -23,7 +23,7 @@ INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
-# --------- DB helpers ---------
+# ---------------- DB helpers ----------------
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -76,7 +76,7 @@ def init_db():
         winner_id   INTEGER
     );
 
-    -- ✅ Missing before: this makes vote buttons actually work.
+    -- Needed for voting buttons to work
     CREATE TABLE IF NOT EXISTS voter (
         match_id  INTEGER NOT NULL,
         user_id   INTEGER NOT NULL,
@@ -84,12 +84,17 @@ def init_db():
         PRIMARY KEY (match_id, user_id),
         FOREIGN KEY(match_id) REFERENCES match(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS guild_settings (
+        guild_id           INTEGER PRIMARY KEY,
+        ticket_category_id INTEGER
+    );
     """)
     con.commit(); con.close()
 
 init_db()
 
-# --------- Utils ---------
+# ---------------- Utils ----------------
 def rel_ts(dt_utc: datetime) -> str:
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
@@ -109,10 +114,28 @@ def parse_duration_to_seconds(text: str, default_unit="h") -> int:
     unit = m.group(2) or default_unit
     minutes = val * (60 if unit == "h" else 1)
     seconds = int(round(minutes * 60))
-    return max(60, min(seconds, 60*60*24*10))  # 1m .. 10d
+    return max(60, min(seconds, 60*60*24*10))  # 1m..10d
 
 def is_admin(member: discord.Member) -> bool:
     return member.guild_permissions.manage_guild or member.guild_permissions.administrator
+
+def get_ticket_category_id(guild_id: int) -> int | None:
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT ticket_category_id FROM guild_settings WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone(); con.close()
+    return (row["ticket_category_id"] if row and row["ticket_category_id"] else None)
+
+def set_ticket_category_id(guild_id: int, category_id: int | None):
+    con = db(); cur = con.cursor()
+    if category_id is None:
+        cur.execute("DELETE FROM guild_settings WHERE guild_id=?", (guild_id,))
+    else:
+        cur.execute(
+            "INSERT INTO guild_settings(guild_id, ticket_category_id) VALUES(?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET ticket_category_id=excluded.ticket_category_id",
+            (guild_id, category_id)
+        )
+    con.commit(); con.close()
 
 async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
     """Delete all Stylo entry ticket channels for this guild and clear DB rows."""
@@ -135,7 +158,7 @@ async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
     finally:
         con.close()
 
-# --------- Optional nice vs-card (with robust fallback) ---------
+# ---------------- VS Card (side-by-side) ----------------
 async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
     async with aiohttp.ClientSession() as sess:
         async with sess.get(left_url) as r1: Lb = await r1.read()
@@ -163,7 +186,7 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
     out.seek(0)
     return out
 
-# --------- Join Button ---------
+# ---------------- Join button ----------------
 def build_join_view(enabled: bool = True) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join", disabled=not enabled)
@@ -174,7 +197,7 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
     view.add_item(btn)
     return view
 
-# --------- Voting UI ---------
+# ---------------- Voting UI ----------------
 class MatchView(discord.ui.View):
     def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str):
         timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
@@ -184,7 +207,6 @@ class MatchView(discord.ui.View):
         self.btn_right.label = f"Vote {right_label}"
 
     async def _vote(self, interaction: discord.Interaction, side: str):
-        # DB safety so errors don't kill the UI
         try:
             con = db(); cur = con.cursor()
             cur.execute("SELECT left_votes, right_votes, end_utc FROM match WHERE id=?", (self.match_id,))
@@ -217,7 +239,7 @@ class MatchView(discord.ui.View):
         except Exception as e:
             print(f"[stylo] vote error: {e!r}")
             try:
-                await interaction.response.send_message("Voting error — please try again.", ephemeral=True)
+                await interaction.response.send_message("Voting error — try again.", ephemeral=True)
             except Exception:
                 pass
             return
@@ -225,7 +247,6 @@ class MatchView(discord.ui.View):
             try: con.close()
             except: pass
 
-        # live totals update
         if interaction.message and interaction.message.embeds:
             em = interaction.message.embeds[0]
             if em.fields:
@@ -251,7 +272,7 @@ class MatchView(discord.ui.View):
             if isinstance(c, discord.ui.Button):
                 c.disabled = True
 
-# --------- Start Modal ---------
+# ---------------- Start modal ----------------
 class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
     theme = discord.ui.TextInput(label="Theme / Title", placeholder="Enchanted Garden", max_length=100)
     entry_hours = discord.ui.TextInput(label="Entry window (hours)", default="24")
@@ -306,9 +327,9 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             traceback.print_exc(file=sys.stderr)
             await inter.followup.send(textwrap.shorten(f"Start failed: {e!r}", width=300), ephemeral=True)
 
-# --------- Join Modal ---------
+# ---------------- Join modal ----------------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="MikeyMoon / Mike", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholer="MikeyMoon / Mike", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -351,8 +372,14 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                 else:
                     cur.execute("DELETE FROM ticket WHERE entrant_id=?", (entrant_id,)); con.commit()
 
-            # create a private ticket at guild root
             guild = inter.guild
+            category = None
+            cat_id = get_ticket_category_id(guild.id)
+            if cat_id:
+                maybe = guild.get_channel(cat_id)
+                if isinstance(maybe, discord.CategoryChannel):
+                    category = maybe
+
             default = guild.default_role
             admin_roles = [r for r in guild.roles if r.permissions.administrator]
             overwrites = {
@@ -365,9 +392,9 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 
             ticket_name = f"stylo-entry-{inter.user.name}".lower()[:90]
             try:
-                ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket")
+                ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket", category=category)
             except discord.Forbidden:
-                await inter.response.send_message("I can't create a ticket here (permissions).", ephemeral=True); return
+                ticket = await guild.create_text_channel(ticket_name, overwrites=overwrites, reason="Stylo entry ticket (fallback)")
 
             cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)", (entrant_id, ticket.id))
             con.commit(); con.close()
@@ -376,7 +403,7 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                 title="📸 Submit your outfit image",
                 description=("Upload **one** square (1:1) image here.\n"
                              "You can re-upload to replace it—your **latest image** before entries close is used.\n"
-                             "This channel will be deleted automatically when voting starts."),
+                             "This channel will be deleted when voting starts."),
                 colour=EMBED_COLOUR
             )
             await ticket.send(content=inter.user.mention, embed=info)
@@ -390,7 +417,7 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             except discord.InteractionResponded:
                 await inter.followup.send(textwrap.shorten(f"Join failed: {e!r}", width=300), ephemeral=True)
 
-# --------- Capture image inside ticket ---------
+# ---------------- Message listener: capture image ----------------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -436,34 +463,48 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# --------- Commands ---------
+# ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
 async def stylo_cmd(inter: discord.Interaction):
     if not is_admin(inter.user):
         await inter.response.send_message("Admins only.", ephemeral=True); return
     await inter.response.send_modal(StyloStartModal(inter))
 
+@bot.tree.command(name="stylo_set_ticket_category", description="Set the category for entry tickets (admin only).")
+@app_commands.describe(category="Pick a category where ticket channels will be created.")
+async def stylo_set_ticket_category(inter: discord.Interaction, category: discord.CategoryChannel):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    me = inter.guild.me
+    perms = category.permissions_for(me)
+    missing = []
+    if not perms.view_channel:    missing.append("View Channel (category)")
+    if not perms.manage_channels: missing.append("Manage Channels (category)")
+    if missing:
+        await inter.response.send_message(
+            "I can’t use that category — missing: **" + ", ".join(missing) + "**.",
+            ephemeral=True
+        ); return
+    set_ticket_category_id(inter.guild_id, category.id)
+    await inter.response.send_message(f"✅ Ticket category set to **{category.name}**", ephemeral=True)
+
 @bot.tree.command(name="stylo_debug", description="Show Stylo status (admin only).")
 async def stylo_debug(inter: discord.Interaction):
     if not is_admin(inter.user):
         await inter.response.send_message("Admins only.", ephemeral=True); return
-
     con = db(); cur = con.cursor()
     cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
     ev = cur.fetchone()
     if not ev:
         con.close(); await inter.response.send_message("No active event.", ephemeral=True); return
-
     cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (inter.guild_id,))
     total_entrants = cur.fetchone()["c"] or 0
     cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''", (inter.guild_id,))
     with_image = cur.fetchone()["c"] or 0
     cur.execute("SELECT COUNT(*) AS c FROM match WHERE guild_id=? AND round_index=?", (inter.guild_id, ev["round_index"]))
     matches_in_round = cur.fetchone()["c"] or 0
-
     now = datetime.now(timezone.utc)
     entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
-
     con.close()
     msg = (
         f"**Event state:** `{ev['state']}`  |  **Round:** `{ev['round_index']}`\n"
@@ -474,7 +515,7 @@ async def stylo_debug(inter: discord.Interaction):
     )
     await inter.response.send_message(msg, ephemeral=True)
 
-# --------- Scheduler ---------
+# ---------------- Scheduler ----------------
 @tasks.loop(seconds=20)
 async def scheduler():
     now = datetime.now(timezone.utc)
@@ -588,11 +629,14 @@ async def scheduler():
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
 
                         try:
+                            # Composite image
                             card = await build_vs_card((L["image_url"] or "").strip(), (R["image_url"] or "").strip())
                             file = discord.File(fp=card, filename="versus.png")
+                            # IMPORTANT: tell the embed to use the attachment
+                            em.set_image(url="attachment://versus.png")
                             msg = await ch.send(embed=em, view=view, file=file)
                         except Exception:
-                            # fallback: show both images so voters can actually see
+                            # Fallback: show both images so voters can actually see
                             em_left  = discord.Embed(title=L["name"], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R["name"], colour=discord.Colour.dark_grey())
                             Lurl = (L["image_url"] or "").strip(); Rurl = (R["image_url"] or "").strip()
@@ -749,7 +793,7 @@ async def scheduler():
                     await ch.send(embed=em)
                 continue
 
-            # NEXT ROUND from winners
+            # NEXT ROUND from winners (all pairs)
             winner_ids = [w[1] for w in winners]
             placeholders = ",".join("?" for _ in winner_ids)
             cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
@@ -793,7 +837,7 @@ async def scheduler():
 async def _wait_ready():
     await bot.wait_until_ready()
 
-# --------- Ready ---------
+# ---------------- Ready ----------------
 @bot.event
 async def on_ready():
     try:
@@ -804,6 +848,6 @@ async def on_ready():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-# --------- Run ---------
+# ---------------- Run ----------------
 if __name__ == "__main__":
     bot.run(TOKEN)
