@@ -468,7 +468,9 @@ async def on_message(message: discord.Message):
     try:
         # Is this message in a Stylo ticket channel?
         cur.execute(
-            "SELECT entrant.id AS entrant_id FROM ticket JOIN entrant ON entrant.id = ticket.entrant_id WHERE ticket.channel_id=?",
+            "SELECT entrant.id AS entrant_id FROM ticket "
+            "JOIN entrant ON entrant.id = ticket.entrant_id "
+            "WHERE ticket.channel_id=?",
             (message.channel.id,),
         )
         row = cur.fetchone()
@@ -481,8 +483,8 @@ async def on_message(message: discord.Message):
             if att.content_type and att.content_type.startswith("image/"):
                 return True
             name = (att.filename or "").lower().split("?")[0]
-            ext = name.rsplit(".", 1)[-1] if "." in name else ""
-            return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"}
+            ext  = name.rsplit(".", 1)[-1] if "." in name else ""
+            return ext in {"png","jpg","jpeg","gif","webp","heic","heif","bmp","tif","tiff"}
 
         img_url = next((a.url for a in message.attachments if is_image(a)), None)
         if not img_url:
@@ -499,6 +501,7 @@ async def on_message(message: discord.Message):
     finally:
         con.close()
         await bot.process_commands(message)
+
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
@@ -655,11 +658,7 @@ async def scheduler():
                     except: pass
                 except: pass
 
-            # delete all tickets
-            if guild:
-                try: await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
-                except: pass
-
+            
             # announce + lock
             if ch:
                 try:
@@ -763,6 +762,11 @@ async def scheduler():
                         cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
                         con.commit()
                         await asyncio.sleep(0.3)
+
+                        # delete all tickets
+                        if guild:
+                            try: await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
+                            except: pass
                     except Exception as e:
                         print(f"[stylo] posting match {m['id']} failed: {e!r}")
                         continue
@@ -855,17 +859,19 @@ async def scheduler():
 
                         # Attach winner image so it shows outside the private ticket
                         file = None
-                        wurl = (wrow["image_url"] or "").strip() if wrow else ""
+                        wurl = (w["image_url"] or "").strip() if w else ""
                         if wurl:
                             data = await fetch_image_bytes(wurl)
                             if data:
-                                file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
-                                em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
+                                file = discord.File(io.BytesIO(data), filename="champion.png")
+                                em.set_image(url="attachment://champion.png")
+                        
+                        if ch:
+                            if file:
+                                await ch.send(embed=em, file=file)
+                            else:
+                                await ch.send(embed=em)
 
-                        if file:
-                            await ch.send(embed=em, file=file)
-                        else:
-                            await ch.send(embed=em)
                     except Exception as e:
                         print("[stylo] result send error:", e)
 
