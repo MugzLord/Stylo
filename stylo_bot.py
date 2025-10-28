@@ -136,7 +136,7 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
             (guild_id, category_id)
         )
     con.commit(); con.close()
-
+# ---------------- helpers ----------------
 async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
     """Delete all Stylo entry ticket channels for this guild and clear DB rows."""
     if not guild: return
@@ -157,6 +157,18 @@ async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
         con.commit()
     finally:
         con.close()
+        
+async def fetch_image_bytes(url: str) -> bytes | None:
+    if not url:
+        return None
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception as e:
+        print("[stylo] fetch_image_bytes error:", e)
+    return None
 
 # ---------------- VS Card (side-by-side) ----------------
 async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
@@ -686,7 +698,7 @@ async def scheduler():
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
                     
                         msg = None
-                        # Try composite VS image first
+                        # Try composite VS image first (already downloads both internally)
                         if Lurl and Rurl:
                             try:
                                 card = await build_vs_card(Lurl, Rurl)
@@ -694,27 +706,39 @@ async def scheduler():
                                 msg = await ch.send(embed=em, view=view, file=file)
                             except Exception as e:
                                 print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-                    
-                        # Always show the two looks as images if composite failed or any URL missing
+                        
+                        # Always show the two looks with actual attached files if composite didn't work
                         if msg is None:
+                            # Download bytes (bot has permission even if ticket is private)
+                            Lbytes = await fetch_image_bytes(Lurl) if Lurl else None
+                            Rbytes = await fetch_image_bytes(Rurl) if Rurl else None
+                        
                             em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
-                    
-                            if Lurl:
-                                em_left.set_image(url=Lurl)
+                        
+                            files = []
+                            if Lbytes:
+                                fL = discord.File(io.BytesIO(Lbytes), filename="left.png")
+                                files.append(fL)
+                                em_left.set_image(url="attachment://left.png")
                             else:
                                 em_left.description = "No image saved."
-                    
-                            if Rurl:
-                                em_right.set_image(url=Rurl)
+                        
+                            if Rbytes:
+                                fR = discord.File(io.BytesIO(Rbytes), filename="right.png")
+                                files.append(fR)
+                                em_right.set_image(url="attachment://right.png")
                             else:
                                 em_right.description = "No image saved."
-                    
-                            # Header (buttons) + two image embeds
+                        
+                            # Post header (buttons) then the two attached-image embeds
                             header = await ch.send(embed=em, view=view)
-                            await ch.send(embeds=[em_left, em_right])
+                            if files:
+                                await ch.send(embeds=[em_left, em_right], files=files)
+                            else:
+                                await ch.send(embeds=[em_left, em_right])
                             msg = header  # buttons live on the header
-                    
+
                         # thread (best-effort)
                         thread_id = None
                         try:
@@ -818,15 +842,29 @@ async def scheduler():
                     try:
                         cur.execute("SELECT user_id, image_url FROM entrant WHERE id=?", (winner_id,))
                         wrow = cur.fetchone()
+                        # (replace your highlighted block with this)
+
                         winner_mention = (f"<@{wrow['user_id']}>" if wrow and wrow["user_id"] else "the winner")
                         em = discord.Embed(
                             title=f"🏁 Result — {LN} vs {RN}",
                             description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n🏆 **Winner:** {winner_mention}",
                             colour=discord.Colour.green()
                         )
-                        # round result uses thumbnail only
-                        if wrow and (wrow["image_url"] or "").strip():
-                            em.set_thumbnail(url=wrow["image_url"])
+                        
+                        # Attach winner image so it shows outside the private ticket
+                        file = None
+                        wurl = (wrow["image_url"] or "").strip() if wrow else ""
+                        if wurl:
+                            data = await fetch_image_bytes(wurl)   # <-- uses the helper from earlier
+                            if data:
+                                file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
+                                em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
+                        
+                        if file:
+                            await ch.send(embed=em, file=file)
+                        else:
+                            await ch.send(embed=em)
+
                         await ch.send(embed=em)
                     except: pass
 
