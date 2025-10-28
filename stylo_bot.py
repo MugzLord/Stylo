@@ -793,50 +793,49 @@ async def scheduler():
         print(f"[stylo] ERROR entry->voting: {e!r}")
         traceback.print_exc(file=sys.stderr)
 
-    # NEXT ROUND from winners (all pairs)
-    winner_ids = [w[1] for w in winners]
-    placeholders = ",".join("?" for _ in winner_ids)
-    cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
-    next_entrants = cur.fetchall()
-    random.shuffle(next_entrants)
-    
-    next_pairs = []
-    for i in range(0, len(next_entrants), 2):
-        if i + 1 < len(next_entrants):
-            next_pairs.append((next_entrants[i], next_entrants[i + 1]))
-    
-    new_round = ev["round_index"] + 1
-    vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-    vote_end = now + timedelta(seconds=vote_sec)
-    
-    for L, R in next_pairs:
+        # NEXT ROUND from winners (all pairs)
+        winner_ids = [w[1] for w in winners]
+        placeholders = ",".join("?" for _ in winner_ids)
+        cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
+        next_entrants = cur.fetchall()
+        random.shuffle(next_entrants)
+        
+        next_pairs = []
+        for i in range(0, len(next_entrants), 2):
+            if i + 1 < len(next_entrants):
+                next_pairs.append((next_entrants[i], next_entrants[i + 1]))
+        
+        new_round = ev["round_index"] + 1
+        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+        vote_end = now + timedelta(seconds=vote_sec)
+        
+        for L, R in next_pairs:
+            cur.execute(
+                "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat())
+            )
+        con.commit()
+        
         cur.execute(
-            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-            (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat())
+            "UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
+            (new_round, vote_end.isoformat(), ev["guild_id"])
         )
-    con.commit()
-    
-    cur.execute(
-        "UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
-        (new_round, vote_end.isoformat(), ev["guild_id"])
-    )
-    con.commit()
-    
-    if ch:
-        await ch.send(embed=discord.Embed(
-            title=f"🆚 Stylo — Round {new_round} begins!",
-            description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
-                        "Main chat is locked; use each match thread for hype.",
-            colour=EMBED_COLOUR
-        ))
-    
-    # post every match for the new round (images guaranteed)
-    await post_round_matches(ev, new_round, vote_end, con, cur)
-
-
-                        except: pass
+        con.commit()
+        
+        if ch:
+            await ch.send(embed=discord.Embed(
+                title=f"🆚 Stylo — Round {new_round} begins!",
+                description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
+                            "Main chat is locked; use each match thread for hype.",
+                colour=EMBED_COLOUR
+            ))
+  
+                # post every match for the new round (images guaranteed)
+                await post_round_matches(ev, new_round, vote_end, con, cur)
+                
+                    except: pass
                     continue
-
+           
                 # normal winner
                 winner_id = m["left_id"] if L > R else m["right_id"]
                 cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
