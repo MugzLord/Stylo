@@ -798,6 +798,14 @@ async def scheduler():
                                     "Main chat is now **locked** — use each match thread for hype 💬",
                         colour=EMBED_COLOUR
                     ))
+
+                # Lock the main chat for the entire voting duration (Round 1)
+                try:
+                    await ch.set_permissions(guild.default_role, send_messages=False)
+                    print(f"[stylo] Locked main chat for voting (Round {round_index})")
+                except Exception as e:
+                    print(f"[stylo] Failed to lock main chat: {e}")
+
                     # Lock the main channel properly
                     await ch.set_permissions(guild.default_role, send_messages=False)
                     print(f"[stylo] Locked main channel {ch.name} in guild {guild.name}")
@@ -967,6 +975,16 @@ async def scheduler():
                         await ch.send(embed=em)
                 continue
 
+                # Unlock main chat after the Champion is announced
+                if ch and guild:
+                    try:
+                        await ch.set_permissions(guild.default_role, send_messages=True)
+                        await ch.send("💬 Main chat is now open again — celebrate the Champion!")
+                        print("[stylo] Unlocked main chat after Champion announcement")
+                    except Exception as e:
+                        print(f"[stylo] Failed to unlock main chat: {e}")
+
+
             # NEXT ROUND from winners
             winner_ids = [w[1] for w in winners]
             placeholders = ",".join("?" for _ in winner_ids)
@@ -1001,6 +1019,13 @@ async def scheduler():
                                 "Main chat is locked; use each match thread for hype.",
                     colour=EMBED_COLOUR
                 ))
+                # Keep main chat locked for subsequent rounds
+                try:
+                    await ch.set_permissions(guild.default_role, send_messages=False)
+                    print(f"[stylo] Locked main chat for voting (Round {new_round})")
+                except Exception as e:
+                    print(f"[stylo] Failed to lock main chat: {e}")
+
                 # Post all matches for the new round with images
                 await post_round_matches(ev, new_round, vote_end, con, cur)
 
