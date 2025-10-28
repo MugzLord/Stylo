@@ -442,10 +442,14 @@ async def on_message(message: discord.Message):
         return
 
     def is_image(att: discord.Attachment) -> bool:
+        # Trust Discord’s content_type when present
         if att.content_type and att.content_type.startswith("image/"):
             return True
-        ext = (att.filename or "").lower().rsplit(".", 1)[-1]
-        return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif"}
+        # Fall back to extension check (case-insensitive, strip query)
+        name = (att.filename or "").lower().split("?")[0]
+        ext = name.rsplit(".", 1)[-1] if "." in name else ""
+        return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"}
+
 
     img_url = next((a.url for a in message.attachments if is_image(a)), None)
     if not img_url:
@@ -527,6 +531,33 @@ async def stylo_debug(inter: discord.Interaction):
         f"**Entry end (UTC):** {entry_end.isoformat()}  |  **Now:** {now.isoformat()}\n"
     )
     await inter.response.send_message(msg, ephemeral=True)
+
+async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
+    """Best-effort: scan the entrant's ticket channel for the newest image."""
+    con = db(); cur = con.cursor()
+    try:
+        cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row: 
+        return None
+    ch = guild.get_channel(row["channel_id"])
+    if not isinstance(ch, discord.TextChannel):
+        return None
+
+    async for msg in ch.history(limit=50, oldest_first=False):
+        if msg.author.bot: 
+            continue
+        for att in msg.attachments:
+            # Reuse the same relaxed logic
+            ctype_ok = (att.content_type or "").startswith("image/")
+            name = (att.filename or "").lower().split("?")[0]
+            ext = name.rsplit(".", 1)[-1] if "." in name else ""
+            if ctype_ok or ext in {"png","jpg","jpeg","gif","webp","heic","heif","bmp","tif","tiff"}:
+                return att.url
+    return None
+
 
 # ---------------- Scheduler ----------------
 @tasks.loop(seconds=20)
@@ -637,6 +668,13 @@ async def scheduler():
                     
                         Lurl = (L["image_url"] or "").strip()
                         Rurl = (R["image_url"] or "").strip()
+
+                        # If either side has no saved image, try to recover it from the ticket channel
+                        if not Lurl:
+                            Lurl = await fetch_latest_ticket_image_url(guild, m["left_id"]) or ""
+                        if not Rurl:
+                            Rurl = await fetch_latest_ticket_image_url(guild, m["right_id"]) or ""
+
                     
                         em = discord.Embed(
                             title=f"Round {round_index} — {L['name']} vs {R['name']}",
