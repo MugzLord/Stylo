@@ -727,6 +727,9 @@ async def scheduler():
                         if not Rurl:
                             Rurl = await fetch_latest_ticket_image_url(guild, m["right_id"]) or ""
 
+                        # >>> ADD THESE 2 PRINTS HERE <<<
+                        print(f"[stylo] match {m['id']} L={L['name']} url={Lurl!r}")
+                        print(f"[stylo] match {m['id']} R={R['name']} url={Rurl!r}")
                     
                         em = discord.Embed(
                             title=f"Round {round_index} — {L['name']} vs {R['name']}",
@@ -752,6 +755,9 @@ async def scheduler():
                             # Download bytes (bot has permission even if ticket is private)
                             Lbytes = await fetch_image_bytes(Lurl) if Lurl else None
                             Rbytes = await fetch_image_bytes(Rurl) if Rurl else None
+
+                            # >>> ADD THIS PRINT BLOCK HERE <<<
+                            print(f"[stylo] match {m['id']} Lbytes={len(Lbytes) if Lbytes else 0}, Rbytes={len(Rbytes) if Rbytes else 0}")
                         
                             em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
