@@ -13,7 +13,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
-DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")  # uses 'stylo.db' unless you set STYLO_DB_PATH
+DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
 INTENTS = discord.Intents.default()
@@ -40,7 +40,7 @@ def init_db():
         state            TEXT NOT NULL,          -- 'entry' | 'voting' | 'closed'
         entry_end_utc    TEXT NOT NULL,          -- ISO
         vote_hours       INTEGER NOT NULL,
-        vote_seconds     INTEGER,                -- prefers seconds if set
+        vote_seconds     INTEGER,
         round_index      INTEGER NOT NULL DEFAULT 0,
         main_channel_id  INTEGER,
         start_msg_id     INTEGER
@@ -76,7 +76,6 @@ def init_db():
         winner_id   INTEGER
     );
 
-    -- Needed for voting buttons to work
     CREATE TABLE IF NOT EXISTS voter (
         match_id  INTEGER NOT NULL,
         user_id   INTEGER NOT NULL,
@@ -110,8 +109,7 @@ def parse_duration_to_seconds(text: str, default_unit="h") -> int:
     s = (text or "").strip().lower().replace(" ", "")
     m = re.match(r"^([0-9]*\.?[0-9]+)([mh])?$", s)
     if not m: raise ValueError("invalid duration")
-    val = float(m.group(1))
-    unit = m.group(2) or default_unit
+    val = float(m.group(1)); unit = m.group(2) or default_unit
     minutes = val * (60 if unit == "h" else 1)
     seconds = int(round(minutes * 60))
     return max(60, min(seconds, 60*60*24*10))  # 1m..10d
@@ -136,8 +134,10 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
             (guild_id, category_id)
         )
     con.commit(); con.close()
+
 # ---------------- helpers ----------------
 async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
+    """Scan the entrant's ticket channel for the newest image (best-effort)."""
     con = db(); cur = con.cursor()
     try:
         cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
@@ -150,7 +150,7 @@ async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -
     if not isinstance(ch, discord.TextChannel):
         return None
 
-    async for msg in ch.history(limit=80, oldest_first=False):
+    async for msg in ch.history(limit=200, oldest_first=False):
         if msg.author.bot:
             continue
         for att in msg.attachments:
@@ -161,8 +161,19 @@ async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -
                 return att.url
     return None
 
+async def fetch_image_bytes(url: str) -> bytes | None:
+    if not url:
+        return None
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception as e:
+        print("[stylo] fetch_image_bytes error:", e)
+    return None
+
 async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
-    """Delete all Stylo entry ticket channels for this guild and clear DB rows."""
     if not guild: return
     con = db(); cur = con.cursor()
     try:
@@ -181,18 +192,6 @@ async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
         con.commit()
     finally:
         con.close()
-        
-async def fetch_image_bytes(url: str) -> bytes | None:
-    if not url:
-        return None
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(url) as r:
-                if r.status == 200:
-                    return await r.read()
-    except Exception as e:
-        print("[stylo] fetch_image_bytes error:", e)
-    return None
 
 # ---------------- VS Card (side-by-side) ----------------
 async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: int = 24) -> io.BytesIO:
@@ -365,7 +364,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------------- Join modal ----------------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias",placeholder="MikeyMoon / Mike", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias", placeholder="MikeyMoon / Mike", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -456,55 +455,50 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 # ---------------- Message listener: capture image ----------------
 @bot.event
 async def on_message(message: discord.Message):
+    # Only handle guild messages, ignore bots
+    if message.author.bot or not message.guild:
+        return
+
+    # Only care about messages with attachments
     if not message.attachments:
-        con.close()
         await bot.process_commands(message)
         return
 
     con = db(); cur = con.cursor()
-    cur.execute(
-        "SELECT entrant.id AS entrant_id, entrant.user_id "
-        "FROM ticket JOIN entrant ON entrant.id = ticket.entrant_id "
-        "WHERE ticket.channel_id=?",
-        (message.channel.id,),
-    )
-    row = cur.fetchone()
-    if not row:
+    try:
+        # Is this message in a Stylo ticket channel?
+        cur.execute(
+            "SELECT entrant.id AS entrant_id FROM ticket JOIN entrant ON entrant.id = ticket.entrant_id WHERE ticket.channel_id=?",
+            (message.channel.id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            await bot.process_commands(message)
+            return
+
+        # Accept images from ANYONE in the ticket (admins can upload on behalf)
+        def is_image(att: discord.Attachment) -> bool:
+            if att.content_type and att.content_type.startswith("image/"):
+                return True
+            name = (att.filename or "").lower().split("?")[0]
+            ext = name.rsplit(".", 1)[-1] if "." in name else ""
+            return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"}
+
+        img_url = next((a.url for a in message.attachments if is_image(a)), None)
+        if not img_url:
+            await bot.process_commands(message)
+            return
+
+        cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
+        con.commit()
+
+        try: await message.add_reaction("✅")
+        except: pass
+        try: await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used.")
+        except: pass
+    finally:
         con.close()
         await bot.process_commands(message)
-        return
-
-    # accept images from anyone in the ticket (admins can upload on behalf)
-    if not message.attachments:
-        con.close()
-        await bot.process_commands(message)
-        return
-
-    def is_image(att: discord.Attachment) -> bool:
-        # Trust Discord’s content_type when present
-        if att.content_type and att.content_type.startswith("image/"):
-            return True
-        # Fall back to extension check (case-insensitive, strip query)
-        name = (att.filename or "").lower().split("?")[0]
-        ext = name.rsplit(".", 1)[-1] if "." in name else ""
-        return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"}
-
-
-    img_url = next((a.url for a in message.attachments if is_image(a)), None)
-    if not img_url:
-        con.close()
-        await bot.process_commands(message)
-        return
-
-    cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
-    con.commit(); con.close()
-
-    try: await message.add_reaction("✅")
-    except: pass
-    try: await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used.")
-    except: pass
-
-    await bot.process_commands(message)
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
@@ -571,33 +565,6 @@ async def stylo_debug(inter: discord.Interaction):
     )
     await inter.response.send_message(msg, ephemeral=True)
 
-async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
-    """Best-effort: scan the entrant's ticket channel for the newest image."""
-    con = db(); cur = con.cursor()
-    try:
-        cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
-        row = cur.fetchone()
-    finally:
-        con.close()
-    if not row: 
-        return None
-    ch = guild.get_channel(row["channel_id"])
-    if not isinstance(ch, discord.TextChannel):
-        return None
-
-    async for msg in ch.history(limit=50, oldest_first=False):
-        if msg.author.bot: 
-            continue
-        for att in msg.attachments:
-            # Reuse the same relaxed logic
-            ctype_ok = (att.content_type or "").startswith("image/")
-            name = (att.filename or "").lower().split("?")[0]
-            ext = name.rsplit(".", 1)[-1] if "." in name else ""
-            if ctype_ok or ext in {"png","jpg","jpeg","gif","webp","heic","heif","bmp","tif","tiff"}:
-                return att.url
-    return None
-
-
 # ---------------- Scheduler ----------------
 @tasks.loop(seconds=20)
 async def scheduler():
@@ -611,7 +578,8 @@ async def scheduler():
             entry_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
             if now < entry_end:
                 continue
-            # Backfill: make sure each entrant has image_url saved from their ticket history
+
+            # Backfill: ensure each entrant has image_url saved from ticket history
             guild = bot.get_guild(ev["guild_id"])
             if guild:
                 cur.execute("SELECT id, image_url FROM entrant WHERE guild_id=?", (ev["guild_id"],))
@@ -625,7 +593,7 @@ async def scheduler():
                         except Exception as ex:
                             print(f"[stylo] backfill image failed for entrant {e['id']}: {ex!r}")
 
-            # only entrants with a real image url
+            # Only entrants with a real image url
             cur.execute(
                 "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
                 (ev["guild_id"],)
@@ -710,38 +678,36 @@ async def scheduler():
                             (ev["guild_id"], round_index))
                 matches = cur.fetchall()
                 for m in matches:
-                    # --- POST ONE MATCH (robust fallback that always shows images) ---
                     try:
                         # Fetch entrant rows for this match
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
                         if not L or not R:
                             continue
-                    
+
                         Lurl = (L["image_url"] or "").strip()
                         Rurl = (R["image_url"] or "").strip()
 
-                        # If either side has no saved image, try to recover it from the ticket channel
-                        if not Lurl:
+                        # Last-chance recover from ticket history
+                        if not Lurl and guild:
                             Lurl = await fetch_latest_ticket_image_url(guild, m["left_id"]) or ""
-                        if not Rurl:
+                        if not Rurl and guild:
                             Rurl = await fetch_latest_ticket_image_url(guild, m["right_id"]) or ""
 
-                        # >>> ADD THESE 2 PRINTS HERE <<<
                         print(f"[stylo] match {m['id']} L={L['name']} url={Lurl!r}")
                         print(f"[stylo] match {m['id']} R={R['name']} url={Rurl!r}")
-                    
+
                         em = discord.Embed(
                             title=f"Round {round_index} — {L['name']} vs {R['name']}",
                             description="Tap a button to vote. One vote per person.",
                             colour=EMBED_COLOUR
                         )
                         em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                    
+
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
-                    
+
                         msg = None
-                        # Try composite VS image first (already downloads both internally)
+                        # 1) composite VS card
                         if Lurl and Rurl:
                             try:
                                 card = await build_vs_card(Lurl, Rurl)
@@ -749,41 +715,35 @@ async def scheduler():
                                 msg = await ch.send(embed=em, view=view, file=file)
                             except Exception as e:
                                 print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-                        
-                        # Always show the two looks with actual attached files if composite didn't work
+
+                        # 2) attach both images so they render publicly
                         if msg is None:
-                            # Download bytes (bot has permission even if ticket is private)
                             Lbytes = await fetch_image_bytes(Lurl) if Lurl else None
                             Rbytes = await fetch_image_bytes(Rurl) if Rurl else None
-
-                            # >>> ADD THIS PRINT BLOCK HERE <<<
                             print(f"[stylo] match {m['id']} Lbytes={len(Lbytes) if Lbytes else 0}, Rbytes={len(Rbytes) if Rbytes else 0}")
-                        
+
                             em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
-                        
                             files = []
+
                             if Lbytes:
                                 fL = discord.File(io.BytesIO(Lbytes), filename="left.png")
-                                files.append(fL)
-                                em_left.set_image(url="attachment://left.png")
+                                files.append(fL); em_left.set_image(url="attachment://left.png")
                             else:
                                 em_left.description = "No image saved."
-                        
+
                             if Rbytes:
                                 fR = discord.File(io.BytesIO(Rbytes), filename="right.png")
-                                files.append(fR)
-                                em_right.set_image(url="attachment://right.png")
+                                files.append(fR); em_right.set_image(url="attachment://right.png")
                             else:
                                 em_right.description = "No image saved."
-                        
-                            # Post header (buttons) then the two attached-image embeds
+
                             header = await ch.send(embed=em, view=view)
                             if files:
                                 await ch.send(embeds=[em_left, em_right], files=files)
                             else:
                                 await ch.send(embeds=[em_left, em_right])
-                            msg = header  # buttons live on the header
+                            msg = header
 
                         # thread (best-effort)
                         thread_id = None
@@ -799,15 +759,13 @@ async def scheduler():
                             thread_id = thread.id
                         except:
                             pass
-                    
+
                         cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
                         con.commit()
                         await asyncio.sleep(0.3)
                     except Exception as e:
                         print(f"[stylo] posting match {m['id']} failed: {e!r}")
                         continue
-                    # ---------- END SEND MATCH POST ----------
-
         con.close()
     except Exception as e:
         import traceback, sys
@@ -835,8 +793,8 @@ async def scheduler():
 
             for m in matches:
                 L = m["left_votes"]; R = m["right_votes"]
-                cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LNrow = cur.fetchone()
-                cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); RNrow = cur.fetchone()
+                cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["left_id"],)); LNrow = cur.fetchone()
+                cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (m["right_id"],)); RNrow = cur.fetchone()
                 LN = (LNrow["name"] if LNrow else "Left"); RN = (RNrow["name"] if RNrow else "Right")
 
                 if L == R:
@@ -888,31 +846,28 @@ async def scheduler():
                     try:
                         cur.execute("SELECT user_id, image_url FROM entrant WHERE id=?", (winner_id,))
                         wrow = cur.fetchone()
-                        # (replace your highlighted block with this)
-
                         winner_mention = (f"<@{wrow['user_id']}>" if wrow and wrow["user_id"] else "the winner")
                         em = discord.Embed(
                             title=f"🏁 Result — {LN} vs {RN}",
                             description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n🏆 **Winner:** {winner_mention}",
                             colour=discord.Colour.green()
                         )
-                        
+
                         # Attach winner image so it shows outside the private ticket
                         file = None
                         wurl = (wrow["image_url"] or "").strip() if wrow else ""
                         if wurl:
-                            data = await fetch_image_bytes(wurl)   # <-- uses the helper from earlier
+                            data = await fetch_image_bytes(wurl)
                             if data:
                                 file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
                                 em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
-                        
+
                         if file:
                             await ch.send(embed=em, file=file)
                         else:
                             await ch.send(embed=em)
-
-                        await ch.send(embed=em)
-                    except: pass
+                    except Exception as e:
+                        print("[stylo] result send error:", e)
 
             if any_revote:
                 cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
@@ -943,13 +898,23 @@ async def scheduler():
                     description=f"Winner by public vote: **{winner_name}**" + (f"\n<@{w['user_id']}>" if w and w["user_id"] else ""),
                     colour=discord.Colour.gold()
                 )
-                if w and (w["image_url"] or "").strip():
-                    em.set_image(url=w["image_url"])  # full-size for champion
+
+                file = None
+                wurl = (w["image_url"] or "").strip() if w else ""
+                if wurl:
+                    data = await fetch_image_bytes(wurl)
+                    if data:
+                        file = discord.File(io.BytesIO(data), filename="champion.png")
+                        em.set_image(url="attachment://champion.png")
+
                 if ch:
-                    await ch.send(embed=em)
+                    if file:
+                        await ch.send(embed=em, file=file)
+                    else:
+                        await ch.send(embed=em)
                 continue
 
-            # NEXT ROUND from winners (all pairs)
+            # NEXT ROUND from winners
             winner_ids = [w[1] for w in winners]
             placeholders = ",".join("?" for _ in winner_ids)
             cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
@@ -997,9 +962,7 @@ async def _wait_ready():
 @bot.event
 async def on_ready():
     try:
-        # Global sync
         await bot.tree.sync()
-        # Force per-guild sync so new commands show up right away
         for g in bot.guilds:
             try:
                 await bot.tree.sync(guild=discord.Object(id=g.id))
