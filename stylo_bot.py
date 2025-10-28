@@ -638,11 +638,19 @@ async def scheduler():
                             if not (Lurl and Rurl):
                                 raise RuntimeError("Missing image URL(s)")
                         
-                            card = await build_vs_card(Lurl, Rurl)
+                        try:
+                            card = await build_vs_card(L["image_url"], R["image_url"])
                             file = discord.File(fp=card, filename="versus.png")
-                        
-                            # IMPORTANT: make the embed render the attached image inline
-                            em.set_image(url="attachment://versus.png")
+                            msg  = await ch.send(embed=em, view=view, file=file)
+                        except Exception as e:
+                            print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                            # Still post the match so voting can happen
+                            em.add_field(
+                                name="Looks",
+                                value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
+                                inline=False
+                            )
+                            msg = await ch.send(embed=em, view=view)
                         
                             msg = await ch.send(embed=em, view=view, file=file)
                         
