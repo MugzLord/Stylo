@@ -137,6 +137,7 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
 
 # ---------------- helpers ----------------
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
+    """Post all matches for a round with images (composite if possible, attached files as fallback)."""
     guild = bot.get_guild(ev["guild_id"])
     ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
     if not (guild and ch):
@@ -148,6 +149,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
 
     for m in matches:
         try:
+            # entrants
             cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
             cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
             if not L or not R:
@@ -156,11 +158,13 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
             Lurl = (L["image_url"] or "").strip()
             Rurl = (R["image_url"] or "").strip()
 
+            # last-chance recover (useful in R1)
             if not Lurl and guild:
                 Lurl = await fetch_latest_ticket_image_url(guild, m["left_id"]) or ""
             if not Rurl and guild:
                 Rurl = await fetch_latest_ticket_image_url(guild, m["right_id"]) or ""
 
+            # header + buttons
             em = discord.Embed(
                 title=f"Round {round_index} — {L['name']} vs {R['name']}",
                 description="Tap a button to vote. One vote per person.",
@@ -170,6 +174,8 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
             view = MatchView(m["id"], vote_end, L["name"], R["name"])
 
             msg = None
+
+            # 1) composite card
             if Lurl and Rurl:
                 try:
                     card = await build_vs_card(Lurl, Rurl)
@@ -178,6 +184,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 except Exception as e:
                     print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
 
+            # 2) fallback: attach each image so they render
             if msg is None:
                 Lbytes = await fetch_image_bytes(Lurl) if Lurl else None
                 Rbytes = await fetch_image_bytes(Rurl) if Rurl else None
@@ -188,13 +195,15 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
 
                 if Lbytes:
                     fL = discord.File(io.BytesIO(Lbytes), filename="left.png")
-                    files.append(fL); em_left.set_image(url="attachment://left.png")
+                    files.append(fL)
+                    em_left.set_image(url="attachment://left.png")
                 else:
                     em_left.description = "No image saved."
 
                 if Rbytes:
                     fR = discord.File(io.BytesIO(Rbytes), filename="right.png")
-                    files.append(fR); em_right.set_image(url="attachment://right.png")
+                    files.append(fR)
+                    em_right.set_image(url="attachment://right.png")
                 else:
                     em_right.description = "No image saved."
 
@@ -205,6 +214,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                     await ch.send(embeds=[em_left, em_right])
                 msg = header
 
+            # thread (best-effort)
             thread_id = None
             try:
                 thread = await msg.create_thread(
@@ -216,18 +226,17 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                     colour=discord.Colour.dark_grey()
                 ))
                 thread_id = thread.id
-            except:
-                pass
+            except Exception as e:
+                print(f"[stylo] create thread failed: {e!r}")
 
+            # *** THIS IS THE LINE YOUR LOGS POINT TO — KEEP THIS EXACT INDENT (8 SPACES) ***
             cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
             con.commit()
             await asyncio.sleep(0.3)
+
         except Exception as e:
             print(f"[stylo] posting match {m['id']} (round {round_index}) failed: {e!r}")
             continue
-
-
-
 
 async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
     """Scan the entrant's ticket channel for the newest image (best-effort)."""
