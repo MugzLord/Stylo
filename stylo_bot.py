@@ -627,27 +627,28 @@ async def scheduler():
                             (ev["guild_id"], round_index))
                 matches = cur.fetchall()
                 for m in matches:
+                    # --- POST ONE MATCH (robust fallback that always shows images) ---
                     try:
                         # Fetch entrant rows for this match
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
                         if not L or not R:
                             continue
-
+                    
                         Lurl = (L["image_url"] or "").strip()
                         Rurl = (R["image_url"] or "").strip()
-
+                    
                         em = discord.Embed(
                             title=f"Round {round_index} — {L['name']} vs {R['name']}",
                             description="Tap a button to vote. One vote per person.",
                             colour=EMBED_COLOUR
                         )
                         em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-
+                    
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
-
+                    
                         msg = None
-                        # 1) Try a composite VS image if both URLs exist
+                        # Try composite VS image first
                         if Lurl and Rurl:
                             try:
                                 card = await build_vs_card(Lurl, Rurl)
@@ -655,32 +656,27 @@ async def scheduler():
                                 msg = await ch.send(embed=em, view=view, file=file)
                             except Exception as e:
                                 print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-
-                        # 2) Fallback: header only with links
-                        if msg is None and (Lurl or Rurl):
-                            em.add_field(
-                                name="Looks",
-                                value=f"[{L['name']}]({Lurl or 'https://discord.com'})  vs  [{R['name']}]({Rurl or 'https://discord.com'})",
-                                inline=False
-                            )
-                            msg = await ch.send(embed=em, view=view)
-
-                        # 3) Hard fallback: header + two separate image embeds
+                    
+                        # Always show the two looks as images if composite failed or any URL missing
                         if msg is None:
                             em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
+                    
                             if Lurl:
                                 em_left.set_image(url=Lurl)
                             else:
                                 em_left.description = "No image saved."
+                    
                             if Rurl:
                                 em_right.set_image(url=Rurl)
                             else:
                                 em_right.description = "No image saved."
+                    
+                            # Header (buttons) + two image embeds
                             header = await ch.send(embed=em, view=view)
                             await ch.send(embeds=[em_left, em_right])
-                            msg = header  # track header as the match message (buttons live here)
-
+                            msg = header  # buttons live on the header
+                    
                         # thread (best-effort)
                         thread_id = None
                         try:
@@ -693,14 +689,17 @@ async def scheduler():
                                 colour=discord.Colour.dark_grey()
                             ))
                             thread_id = thread.id
-                        except: pass
-
+                        except:
+                            pass
+                    
                         cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
                         con.commit()
                         await asyncio.sleep(0.3)
                     except Exception as e:
                         print(f"[stylo] posting match {m['id']} failed: {e!r}")
                         continue
+                    # ---------- END SEND MATCH POST ----------
+
         con.close()
     except Exception as e:
         import traceback, sys
