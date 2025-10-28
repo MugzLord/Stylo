@@ -137,6 +137,30 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
         )
     con.commit(); con.close()
 # ---------------- helpers ----------------
+async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
+    con = db(); cur = con.cursor()
+    try:
+        cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+    ch = guild.get_channel(row["channel_id"])
+    if not isinstance(ch, discord.TextChannel):
+        return None
+
+    async for msg in ch.history(limit=80, oldest_first=False):
+        if msg.author.bot:
+            continue
+        for att in msg.attachments:
+            ctype_ok = (att.content_type or "").startswith("image/")
+            name = (att.filename or "").lower().split("?")[0]
+            ext = name.rsplit(".", 1)[-1] if "." in name else ""
+            if ctype_ok or ext in {"png","jpg","jpeg","gif","webp","heic","heif","bmp","tif","tiff"}:
+                return att.url
+    return None
+
 async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
     """Delete all Stylo entry ticket channels for this guild and clear DB rows."""
     if not guild: return
@@ -432,7 +456,9 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 # ---------------- Message listener: capture image ----------------
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
+    if not message.attachments:
+        con.close()
+        await bot.process_commands(message)
         return
 
     con = db(); cur = con.cursor()
@@ -448,7 +474,8 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    if message.author.id != row["user_id"] or not message.attachments:
+    # accept images from anyone in the ticket (admins can upload on behalf)
+    if not message.attachments:
         con.close()
         await bot.process_commands(message)
         return
@@ -584,6 +611,19 @@ async def scheduler():
             entry_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
             if now < entry_end:
                 continue
+            # Backfill: make sure each entrant has image_url saved from their ticket history
+            guild = bot.get_guild(ev["guild_id"])
+            if guild:
+                cur.execute("SELECT id, image_url FROM entrant WHERE guild_id=?", (ev["guild_id"],))
+                for e in cur.fetchall():
+                    if not (e["image_url"] or "").strip():
+                        try:
+                            url = await fetch_latest_ticket_image_url(guild, e["id"])
+                            if url:
+                                cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (url, e["id"]))
+                                con.commit()
+                        except Exception as ex:
+                            print(f"[stylo] backfill image failed for entrant {e['id']}: {ex!r}")
 
             # only entrants with a real image url
             cur.execute(
