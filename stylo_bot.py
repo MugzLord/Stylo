@@ -137,7 +137,6 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
 
 # ---------------- helpers ----------------
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
-    """Post all matches for a round with images (composite if possible, attached files as fallback)."""
     guild = bot.get_guild(ev["guild_id"])
     ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
     if not (guild and ch):
@@ -149,7 +148,6 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
 
     for m in matches:
         try:
-            # Entrants
             cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
             cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
             if not L or not R:
@@ -158,13 +156,11 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
             Lurl = (L["image_url"] or "").strip()
             Rurl = (R["image_url"] or "").strip()
 
-            # Last-chance recover (useful for Round 1; harmless later)
             if not Lurl and guild:
                 Lurl = await fetch_latest_ticket_image_url(guild, m["left_id"]) or ""
             if not Rurl and guild:
                 Rurl = await fetch_latest_ticket_image_url(guild, m["right_id"]) or ""
 
-            # Header with buttons
             em = discord.Embed(
                 title=f"Round {round_index} — {L['name']} vs {R['name']}",
                 description="Tap a button to vote. One vote per person.",
@@ -174,7 +170,6 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
             view = MatchView(m["id"], vote_end, L["name"], R["name"])
 
             msg = None
-            # 1) Composite VS card
             if Lurl and Rurl:
                 try:
                     card = await build_vs_card(Lurl, Rurl)
@@ -183,7 +178,6 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 except Exception as e:
                     print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
 
-            # 2) Fallback: attach each look so they always render
             if msg is None:
                 Lbytes = await fetch_image_bytes(Lurl) if Lurl else None
                 Rbytes = await fetch_image_bytes(Rurl) if Rurl else None
@@ -211,7 +205,6 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                     await ch.send(embeds=[em_left, em_right])
                 msg = header
 
-            # Thread (best-effort)
             thread_id = None
             try:
                 thread = await msg.create_thread(
@@ -232,6 +225,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         except Exception as e:
             print(f"[stylo] posting match {m['id']} (round {round_index}) failed: {e!r}")
             continue
+
 
 
 
@@ -767,19 +761,23 @@ async def scheduler():
                                     "Main chat is locked; use each match thread for hype.",
                         colour=EMBED_COLOUR
                     ))
-                    try: await ch.set_permissions(guild.default_role, send_messages=False)
-                    except: pass
-                except: pass
+                    try:
+                        await ch.set_permissions(guild.default_role, send_messages=False)
+                    except:
+                        pass
+                except:
+                    pass
+            
+            # post every Round 1 match (images guaranteed)
+            await post_round_matches(ev, round_index, vote_end, con, cur)
+            
+            # delete tickets AFTER posting matches
+            if guild:
+                try:
+                    await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
+                except:
+                    pass
 
-                    # Post all Round 1 matches with images
-                    await post_round_matches(ev, round_index, vote_end, con, cur)
-                    
-                    # Now it's safe to delete tickets (after posts are out)
-                    if guild:
-                        try:
-                            await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
-                        except:
-                            pass
                 
                         cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
                         con.commit()
@@ -835,8 +833,9 @@ async def scheduler():
             colour=EMBED_COLOUR
         ))
     
-    # ⬇️ IMPORTANT: same indent as the `if ch:` above (not nested)
+    # post every match for the new round (images guaranteed)
     await post_round_matches(ev, new_round, vote_end, con, cur)
+
 
                         except: pass
                     continue
