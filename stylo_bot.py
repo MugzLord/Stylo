@@ -786,19 +786,7 @@ async def scheduler():
                     await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
                 except:
                     pass
-
-                
-                        cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
-                        con.commit()
-                        await asyncio.sleep(0.3)
-
-                        # delete all tickets
-                        if guild:
-                            try: await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
-                            except: pass
-                    except Exception as e:
-                        print(f"[stylo] posting match {m['id']} failed: {e!r}")
-                        continue
+                     
         con.close()
     except Exception as e:
         import traceback, sys
