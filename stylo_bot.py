@@ -795,15 +795,15 @@ async def scheduler():
                     await ch.send(embed=discord.Embed(
                         title=f"🆚 Stylo — Round {round_index} begins!",
                         description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
-                                    "Main chat is locked; use each match thread for hype.",
+                                    "Main chat is now **locked** — use each match thread for hype 💬",
                         colour=EMBED_COLOUR
                     ))
-                    try:
-                        await ch.set_permissions(guild.default_role, send_messages=False)
-                    except:
-                        pass
-                except:
-                    pass
+                    # Lock the main channel properly
+                    await ch.set_permissions(guild.default_role, send_messages=False)
+                    print(f"[stylo] Locked main channel {ch.name} in guild {guild.name}")
+                except Exception as e:
+                    print(f"[stylo] Failed to lock chat: {e}")
+
 
             # post every Round 1 match (images guaranteed)
             await post_round_matches(ev, round_index, vote_end, con, cur)
