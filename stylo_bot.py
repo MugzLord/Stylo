@@ -22,7 +22,6 @@ INTENTS.guilds = True
 INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
-
 # ---------------- DB helpers ----------------
 def db():
     con = sqlite3.connect(DB_PATH)
