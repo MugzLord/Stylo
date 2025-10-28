@@ -22,6 +22,7 @@ INTENTS.guilds = True
 INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
+
 # ---------------- DB helpers ----------------
 def db():
     con = sqlite3.connect(DB_PATH)
@@ -328,7 +329,7 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
 
 # ---------------- Join modal ----------------
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name / alias", max_length=50)
+    display_name = discord.ui.TextInput(label="Display name / alias",placeholder="MikeyMoon / Mike", max_length=50)
     caption = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
 
     def __init__(self, inter: discord.Interaction):
@@ -487,6 +488,19 @@ async def stylo_set_ticket_category(inter: discord.Interaction, category: discor
     set_ticket_category_id(inter.guild_id, category.id)
     await inter.response.send_message(f"✅ Ticket category set to **{category.name}**", ephemeral=True)
 
+@bot.tree.command(name="stylo_show_ticket_category", description="Show the configured ticket category (admin only).")
+async def stylo_show_ticket_category(inter: discord.Interaction):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    cat_id = get_ticket_category_id(inter.guild_id)
+    if not cat_id:
+        await inter.response.send_message("No ticket category set.", ephemeral=True); return
+    cat = inter.guild.get_channel(cat_id)
+    if isinstance(cat, discord.CategoryChannel):
+        await inter.response.send_message(f"Current ticket category: **{cat.name}**", ephemeral=True)
+    else:
+        await inter.response.send_message("Stored ticket category no longer exists.", ephemeral=True)
+
 @bot.tree.command(name="stylo_debug", description="Show Stylo status (admin only).")
 async def stylo_debug(inter: discord.Interaction):
     if not is_admin(inter.user):
@@ -532,7 +546,8 @@ async def scheduler():
             cur.execute(
                 "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
                 (ev["guild_id"],)
-                        entrants = cur.fetchall()
+            )
+            entrants = cur.fetchall()
 
             guild = bot.get_guild(ev["guild_id"])
             ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
@@ -612,68 +627,60 @@ async def scheduler():
                             (ev["guild_id"], round_index))
                 matches = cur.fetchall()
                 for m in matches:
-                    # --- POST ONE MATCH (REPLACE YOUR CURRENT TRY/EXCEPT FOR SENDING) ---
                     try:
                         # Fetch entrant rows for this match
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
                         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
                         if not L or not R:
                             continue
-                        
+
                         Lurl = (L["image_url"] or "").strip()
                         Rurl = (R["image_url"] or "").strip()
-                        
+
                         em = discord.Embed(
                             title=f"Round {round_index} — {L['name']} vs {R['name']}",
                             description="Tap a button to vote. One vote per person.",
                             colour=EMBED_COLOUR
                         )
                         em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-                        
+
                         view = MatchView(m["id"], vote_end, L["name"], R["name"])
-                        
-                        try:
-                            # 1) Try to post a composite VS image
-                            if not (Lurl and Rurl):
-                                raise RuntimeError("Missing image URL(s)")
-                        
-                        try:
-                            card = await build_vs_card(L["image_url"], R["image_url"])
-                            file = discord.File(fp=card, filename="versus.png")
-                            msg  = await ch.send(embed=em, view=view, file=file)
-                        except Exception as e:
-                            print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-                            # Still post the match so voting can happen
+
+                        msg = None
+                        # 1) Try a composite VS image if both URLs exist
+                        if Lurl and Rurl:
+                            try:
+                                card = await build_vs_card(Lurl, Rurl)
+                                file = discord.File(fp=card, filename="versus.png")
+                                msg = await ch.send(embed=em, view=view, file=file)
+                            except Exception as e:
+                                print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+
+                        # 2) Fallback: header only with links
+                        if msg is None and (Lurl or Rurl):
                             em.add_field(
                                 name="Looks",
-                                value=f"[{L['name']}]({L['image_url']})  vs  [{R['name']}]({R['image_url']})",
+                                value=f"[{L['name']}]({Lurl or 'https://discord.com'})  vs  [{R['name']}]({Rurl or 'https://discord.com'})",
                                 inline=False
                             )
                             msg = await ch.send(embed=em, view=view)
-                        
-                            msg = await ch.send(embed=em, view=view, file=file)
-                        
-                        except Exception as e:
-                            print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
-                        
-                            # 2) Hard fallback: two separate image embeds so voters still see both looks
+
+                        # 3) Hard fallback: header + two separate image embeds
+                        if msg is None:
                             em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
                             em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
-                        
                             if Lurl:
                                 em_left.set_image(url=Lurl)
                             else:
                                 em_left.description = "No image saved."
-                        
                             if Rurl:
                                 em_right.set_image(url=Rurl)
                             else:
                                 em_right.description = "No image saved."
-                        
-                            # Send the header (buttons) first, then the two images
                             header = await ch.send(embed=em, view=view)
-                            msg = await ch.send(embeds=[em_left, em_right])
-                        # ---------- END SEND MATCH POST ----------
+                            await ch.send(embeds=[em_left, em_right])
+                            msg = header  # track header as the match message (buttons live here)
+
                         # thread (best-effort)
                         thread_id = None
                         try:
@@ -883,7 +890,6 @@ async def on_ready():
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
