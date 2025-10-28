@@ -30,8 +30,9 @@ def db():
     return con
 
 def init_db():
-    con = db(); cur = con.cursor()
-    cur.executescripts = cur.executescript("""
+    con = db()
+    cur = con.cursor()
+    cur.executescript("""
     PRAGMA journal_mode=WAL;
 
     CREATE TABLE IF NOT EXISTS event (
@@ -89,7 +90,9 @@ def init_db():
         ticket_category_id INTEGER
     );
     """)
-    con.commit(); con.close()
+    con.commit()
+    con.close()
+
 
 init_db()
 
