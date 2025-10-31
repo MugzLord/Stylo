@@ -383,19 +383,23 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
 # ---------------- Join button ----------------
 def build_join_view(enabled: bool = True) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    btn = discord.ui.Button(style=discord.ButtonStyle.success, label="Join", custom_id="stylo:join", disabled=not enabled)
+    btn = discord.ui.Button(
+        style=discord.ButtonStyle.success,
+        label="Join",
+        custom_id="stylo:join",
+        disabled=not enabled,
+    )
 
     async def join_cb(i: discord.Interaction):
         if i.user.bot:
             return
-        # 👇 add this line
-        await i.response.defer(ephemeral=True)
-        # 👇 then show the modal
-        await i.followup.send_modal(EntrantModal(i))
+        # ✅ send the modal directly on the interaction
+        await i.response.send_modal(EntrantModal(i))
 
     btn.callback = join_cb
     view.add_item(btn)
     return view
+
 
 
 # ---------------- Voting UI ----------------
