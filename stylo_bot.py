@@ -981,7 +981,7 @@ async def scheduler():
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='entry'")
         for ev in cur.fetchall():
-            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
+            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
             if now < entry_end:
                 continue
 
@@ -1106,7 +1106,7 @@ async def scheduler():
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='voting'")
         for ev in cur.fetchall():
-            round_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
+            round_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
             if now < round_end:
                 continue
 
