@@ -797,10 +797,30 @@ async def stylo_finish_round_now(inter: discord.Interaction):
 
     for m in matches:
         L = m["left_votes"]; R = m["right_votes"]
-        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["left_id"],)); Lrow = cur.fetchone()
-        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["right_id"],)); Rrow = cur.fetchone()
+
+        # 🚩 NEW: if the match was never posted, post it now instead of tie-breaking
+        if m["msg_id"] is None:
+            try:
+                new_end = now + timedelta(seconds=vote_sec)
+                await post_round_matches(ev, ev["round_index"], new_end, con, cur)
+                cur.execute(
+                    "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                    (new_end.isoformat(), ev["guild_id"])
+                )
+                con.commit()
+            except Exception as ex:
+                print(f"[stylo_finish] re-post missing match {m['id']} failed: {ex!r}")
+            continue
+
+        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["left_id"],))
+        Lrow = cur.fetchone()
+        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["right_id"],))
+        Rrow = cur.fetchone()
         LN = (Lrow["name"] if Lrow else "Left")
         RN = (Rrow["name"] if Rrow else "Right")
+
+        # ... keep the rest of your tie / normal winner logic here ...
+
 
         # ---- tie handling (same as we wanted) ----
         if L == R:
@@ -1217,16 +1237,18 @@ async def scheduler():
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='voting'")
         for ev in cur.fetchall():
-            round_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+            round_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
             if now < round_end:
                 continue
 
             guild = bot.get_guild(ev["guild_id"])
-            ch = (guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"])
-                  else (guild.system_channel if guild else None))
+            ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
 
-            cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
-                        (ev["guild_id"], ev["round_index"]))
+            # get all matches in this round that don't have a winner yet
+            cur.execute(
+                "SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+                (ev["guild_id"], ev["round_index"])
+            )
             matches = cur.fetchall()
 
             winners = []
@@ -1235,16 +1257,42 @@ async def scheduler():
 
             # ----- resolve matches -----
             for m in matches:
-                L = m["left_votes"]; R = m["right_votes"]
-                cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LNrow = cur.fetchone()
-                cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); RNrow = cur.fetchone()
-                LN = (LNrow["name"] if LNrow else "Left"); RN = (RNrow["name"] if RNrow else "Right")
+                L = m["left_votes"]
+                R = m["right_votes"]
 
+                # 🚩 NEW: match exists in DB but was NEVER posted -> post it now, don't tie-break
+                if m["msg_id"] is None:
+                    try:
+                        new_end = now + timedelta(seconds=vote_sec)
+                        # try to re-post ALL missing matches for this round
+                        await post_round_matches(ev, ev["round_index"], new_end, con, cur)
+                        # extend round so people can vote on the newly posted match
+                        cur.execute(
+                            "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                            (new_end.isoformat(), ev["guild_id"])
+                        )
+                        con.commit()
+                    except Exception as ex:
+                        print(f"[stylo] scheduler re-post missing match {m['id']} failed: {ex!r}")
+                    # skip this match for this tick
+                    continue
+
+                # fetch entrant names (as before)
+                cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
+                LNrow = cur.fetchone()
+                cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
+                RNrow = cur.fetchone()
+                LN = (LNrow["name"] if LNrow else "Left")
+                RN = (RNrow["name"] if RNrow else "Right")
+
+                # ---- tie handling ----
                 if L == R:
                     any_revote = True
                     new_end = now + timedelta(seconds=vote_sec)
-                    cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
-                                (new_end.isoformat(), m["id"]))
+                    cur.execute(
+                        "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                        (new_end.isoformat(), m["id"])
+                    )
                     cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
                     con.commit()
 
@@ -1260,13 +1308,9 @@ async def scheduler():
                                 em.set_field_at(0, name="Live totals", value="Total votes: **0**", inline=False)
                             else:
                                 em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
-                            
-                            # show the new closing time again
                             em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
-                            
                             view = MatchView(m["id"], new_end, LN, RN)
                             await msg.edit(embed=em, view=view)
-
                         except:
                             pass
 
@@ -1281,10 +1325,12 @@ async def scheduler():
                             pass
                     continue
 
-                # normal winner
+                # ---- normal winner ----
                 winner_id = m["left_id"] if L > R else m["right_id"]
-                cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
-                            (winner_id, now.isoformat(), m["id"]))
+                cur.execute(
+                    "UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+                    (winner_id, now.isoformat(), m["id"])
+                )
                 con.commit()
                 winners.append((m["id"], winner_id, LN, RN, L, R))
 
@@ -1316,15 +1362,23 @@ async def scheduler():
                     except Exception as ex:
                         print("[stylo] result send error:", ex)
 
+            # ----- if any re-vote, extend round and continue -----
             if any_revote:
-                cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
-                            (ev["guild_id"], ev["round_index"]))
+                cur.execute(
+                    "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                    (ev["guild_id"], ev["round_index"])
+                )
                 mx = cur.fetchone()["mx"]
                 if mx:
-                    cur.execute("UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
-                                (mx, ev["guild_id"]))
+                    cur.execute(
+                        "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                        (mx, ev["guild_id"])
+                    )
                     con.commit()
                 continue
+
+            # ... keep your existing "unlock / champion / next round" code here ...
+
 
             # ----- ODD-FIX (per-round): at most 1 extra match to make it even -----
             # get everyone who actually fought THIS round
