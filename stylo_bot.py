@@ -976,99 +976,145 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             except Exception as ex:
                 print("[stylo_finish] result send err:", ex)
 
-    # if any match was re-voted, just extend that round
-    if any_revote:
-        # set event end to latest match end
-        cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
-                    (ev["guild_id"], ev["round_index"]))
-        mx = cur.fetchone()["mx"]
-        if mx:
-            cur.execute("UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
-                        (mx, ev["guild_id"]))
+
+            # ----- if any re-vote, extend round and continue -----
+            if any_revote:
+                cur.execute(
+                    "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                    (ev["guild_id"], ev["round_index"])
+                )
+                mx = cur.fetchone()["mx"]
+                if mx:
+                    cur.execute(
+                        "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                        (mx, ev["guild_id"])
+                    )
+                    con.commit()
+                # go to next event, don't start a new round
+                continue
+
+            # 🔴 NEW: if we got here and we have NO winners at all,
+            # it means there was nothing to advance -> just close it
+            if not winners:
+                # unlock
+                if ch and guild:
+                    try:
+                        await ch.set_permissions(guild.default_role, send_messages=True)
+                    except:
+                        pass
+                # close event
+                cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+                con.commit()
+                if ch:
+                    try:
+                        await ch.send(embed=discord.Embed(
+                            title="⛔ Stylo ended",
+                            description="No valid matches to advance, so this round was closed.",
+                            colour=discord.Colour.red()
+                        ))
+                    except:
+                        pass
+                continue
+
+            # ----- unlock main chat because we're moving on -----
+            if ch and guild:
+                try:
+                    await ch.set_permissions(guild.default_role, send_messages=True)
+                except:
+                    pass
+
+            # CHAMPION?
+            if len(winners) == 1:
+                champ_id = winners[0][1]
+                cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+                con.commit()
+
+                cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (champ_id,))
+                w = cur.fetchone()
+                winner_name = (w["name"] if w else "Unknown")
+                em = discord.Embed(
+                    title=f"👑 Stylo Champion — {ev['theme']}",
+                    description=f"Winner by public vote: **{winner_name}**" + (f"\n<@{w['user_id']}>" if w and w["user_id"] else ""),
+                    colour=discord.Colour.gold()
+                )
+
+                file = None
+                wurl = (w["image_url"] or "").strip() if w else ""
+                if wurl:
+                    data = await fetch_image_bytes(wurl)
+                    if data:
+                        file = discord.File(io.BytesIO(data), filename="champion.png")
+                        em.set_image(url="attachment://champion.png")
+
+                if ch:
+                    if file:
+                        await ch.send(embed=em, file=file)
+                    else:
+                        await ch.send(embed=em)
+                continue
+
+            # ----- build next round from winners -----
+            winner_ids = [w[1] for w in winners]
+            placeholders = ",".join("?" for _ in winner_ids)
+            cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
+            next_entrants = cur.fetchall()
+            random.shuffle(next_entrants)
+
+            next_pairs = []
+            for i in range(0, len(next_entrants), 2):
+                if i + 1 < len(next_entrants):
+                    next_pairs.append((next_entrants[i], next_entrants[i + 1]))
+
+            # 🔴 if for some reason we STILL have no pairs -> just close it
+            if not next_pairs:
+                if ch and guild:
+                    try:
+                        await ch.set_permissions(guild.default_role, send_messages=True)
+                    except:
+                        pass
+                    try:
+                        await ch.send(embed=discord.Embed(
+                            title="⛔ Stylo ended",
+                            description="Not enough looks to continue to the next round.",
+                            colour=discord.Colour.red()
+                        ))
+                    except:
+                        pass
+                cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+                con.commit()
+                continue
+
+            new_round = ev["round_index"] + 1
+            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+            vote_end = now + timedelta(seconds=vote_sec)
+
+            for L, R in next_pairs:
+                cur.execute(
+                    "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                    (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat())
+                )
             con.commit()
-        con.close()
-        await inter.followup.send("Some matches were tied — re-votes opened. Others were processed.", ephemeral=True)
-        return
 
-    # no re-votes -> proceed to next round / champion
-    # unlock main chat for a moment (your main scheduler also does this)
-    if ch and guild:
-        try:
-            await ch.set_permissions(guild.default_role, send_messages=True)
-        except:
-            pass
+            cur.execute(
+                "UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
+                (new_round, vote_end.isoformat(), ev["guild_id"])
+            )
+            con.commit()
 
-    # champion if only 1 winner
-    if len(winners) == 1:
-        champ_id = winners[0][1]
-        cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
-        con.commit()
+            if ch:
+                await ch.send(embed=discord.Embed(
+                    title=f"🆚 Stylo — Round {new_round} begins!",
+                    description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
+                                "Main chat is locked; use each match thread for hype.",
+                    colour=EMBED_COLOUR
+                ))
+                try:
+                    await ch.set_permissions(guild.default_role, send_messages=False)
+                except Exception as e:
+                    print("[stylo] Failed to lock main chat:", e)
 
-        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (champ_id,))
-        w = cur.fetchone()
-        winner_name = (w["name"] if w else "Unknown")
-        em = discord.Embed(
-            title=f"👑 Stylo Champion — {ev['theme']}",
-            description=f"Winner by public vote: **{winner_name}**" + (f"\n<@{w['user_id']}>" if w and w["user_id"] else ""),
-            colour=discord.Colour.gold()
-        )
-        file = None
-        wurl = (w["image_url"] or "").strip() if w else ""
-        if wurl:
-            data = await fetch_image_bytes(wurl)
-            if data:
-                file = discord.File(io.BytesIO(data), filename="champion.png")
-                em.set_image(url="attachment://champion.png")
+                await post_round_matches(ev, new_round, vote_end, con, cur)
 
-        if ch:
-            if file:
-                await ch.send(embed=em, file=file)
-            else:
-                await ch.send(embed=em)
-
-        con.close()
-        await inter.followup.send("Round finished and Champion announced. ✅", ephemeral=True)
-        return
-
-    # build next round from these winners
-    winner_ids = [w[1] for w in winners]
-    placeholders = ",".join("?" for _ in winner_ids)
-    cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
-    next_entrants = cur.fetchall()
-    random.shuffle(next_entrants)
-
-    next_pairs = []
-    for i in range(0, len(next_entrants), 2):
-        if i + 1 < len(next_entrants):
-            next_pairs.append((next_entrants[i], next_entrants[i + 1]))
-
-    new_round = ev["round_index"] + 1
-    vote_end = now + timedelta(seconds=vote_sec)
-
-    for L, R in next_pairs:
-        cur.execute(
-            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-            (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat())
-        )
-    con.commit()
-
-    cur.execute("UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
-                (new_round, vote_end.isoformat(), ev["guild_id"]))
-    con.commit()
-
-    if ch:
-        await ch.send(embed=discord.Embed(
-            title=f"🆚 Stylo — Round {new_round} begins!",
-            description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\nMain chat is locked; use each match thread for hype.",
-            colour=EMBED_COLOUR
-        ))
-        try:
-            await ch.set_permissions(guild.default_role, send_messages=False)
-        except Exception as e:
-            print("[stylo_finish] failed to lock main chat:", e)
-
-        # post matches for this new round
-        await post_round_matches(ev, new_round, vote_end, con, cur)
 
     con.close()
     await inter.followup.send("Round finished, next round posted. ✅", ephemeral=True)
