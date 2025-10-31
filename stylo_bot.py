@@ -1426,14 +1426,16 @@ async def scheduler():
            
             # ----- ROUND IS NOW FULLY DECIDED (no more re-votes) -----
 
-            # 1) get ALL winners in THIS round (not just from this tick)
+                        # ----- ROUND IS NOW FULLY DECIDED (no more re-votes) -----
+
+            # 1) get ALL winners in THIS round
             cur.execute(
                 "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
                 (ev["guild_id"], ev["round_index"])
             )
             all_winners_this_round = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
 
-            # 2) who actually fought in this round (build properly)
+            # 2) who actually fought in this round
             cur.execute(
                 "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
                 (ev["guild_id"], ev["round_index"])
@@ -1444,7 +1446,7 @@ async def scheduler():
                 fought_ids.add(r["left_id"])
                 fought_ids.add(r["right_id"])
 
-            # 3) leftover check ONLY for round 1 (that’s where odd numbers happen)
+            # 3) leftover: ONLY care on round 1
             if ev["round_index"] == 1:
                 cur.execute(
                     "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
@@ -1456,22 +1458,26 @@ async def scheduler():
                 leftover_ids = []
 
             created_special = False
+            pushed_leftover_forward = False
 
-            # 4) round 1 odd-fix → create special match
+            # 4) round 1 odd-fix → try to create special match
             if ev["round_index"] == 1 and len(leftover_ids) == 1 and len(all_winners_this_round) >= 1:
                 leftover_id = leftover_ids[0]
-                # make sure we didn’t already create a special for this leftover
+
+                # make sure no special for this leftover yet
                 cur.execute(
                     "SELECT 1 FROM match WHERE guild_id=? AND round_index=? AND (left_id=? OR right_id=?) LIMIT 1",
                     (ev["guild_id"], ev["round_index"], leftover_id, leftover_id)
                 )
                 already_has_special = cur.fetchone() is not None
+
                 if not already_has_special:
-                    # find strongest non-winner from this round
                     best_loser_id = None
                     best_loser_votes = -1
+
+                    # look for strongest non-winner FROM THIS ROUND
                     cur.execute(
-                        "SELECT id, left_id, right_id, left_votes, right_votes, winner_id "
+                        "SELECT id,left_id,right_id,left_votes,right_votes,winner_id "
                         "FROM match WHERE guild_id=? AND round_index=?",
                         (ev["guild_id"], ev["round_index"])
                     )
@@ -1484,16 +1490,21 @@ async def scheduler():
                         else:
                             loser_id = mrow["left_id"]
                             loser_votes = mrow["left_votes"]
+
+                        # don't match leftover with itself
                         if loser_id == leftover_id:
                             continue
+
                         if loser_votes > best_loser_votes:
                             best_loser_votes = loser_votes
                             best_loser_id = loser_id
 
                     if best_loser_id is not None:
+                        # ✅ we found a loser to fight the leftover -> make special IN SAME ROUND
                         vote_end_2 = now + timedelta(seconds=vote_sec)
                         cur.execute(
-                            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) "
+                            "VALUES(?,?,?,?,?)",
                             (ev["guild_id"], ev["round_index"], leftover_id, best_loser_id, vote_end_2.isoformat())
                         )
                         con.commit()
@@ -1510,19 +1521,25 @@ async def scheduler():
                             ))
                         await post_round_matches(ev, ev["round_index"], vote_end_2, con, cur)
                         created_special = True
+                    else:
+                        # ❗ we COULDN'T build the special (your case) → just push leftover to next round
+                        all_winners_this_round.append(leftover_id)
+                        leftover_ids = []
+                        pushed_leftover_forward = True
 
             if created_special:
-                # wait for the special match to finish
+                # we just added a new match in this same round, wait for it
                 continue
 
-            # 5) unlock chat before we either close or start next round
+            # 5) unlock chat before close / next round
             if ch and guild:
                 try:
                     await ch.set_permissions(guild.default_role, send_messages=True)
                 except:
                     pass
 
-            # 6) CHAMPION — if only 1 winner, no leftovers → we’re done
+            # 6) CHAMPION?
+            # if after all that there is exactly 1 advancing look and NO leftovers -> final
             if len(all_winners_this_round) == 1 and not leftover_ids:
                 champ_id = all_winners_this_round[0]
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
@@ -1559,7 +1576,7 @@ async def scheduler():
 
                 continue
 
-            # 7) NEXT ROUND — 2 or more winners → make new pairs
+            # 7) NEXT ROUND — 2 or more looks to advance
             if len(all_winners_this_round) >= 2:
                 random.shuffle(all_winners_this_round)
                 new_round = ev["round_index"] + 1
@@ -1568,7 +1585,8 @@ async def scheduler():
                 for i in range(0, len(all_winners_this_round), 2):
                     if i + 1 < len(all_winners_this_round):
                         cur.execute(
-                            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) "
+                            "VALUES(?,?,?,?,?)",
                             (ev["guild_id"], new_round,
                              all_winners_this_round[i], all_winners_this_round[i+1], vote_end.isoformat())
                         )
