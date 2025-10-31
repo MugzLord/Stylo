@@ -578,7 +578,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # Only care about messages with attachments
+    # If no attachments, just let commands run
     if not message.attachments:
         await bot.process_commands(message)
         return
@@ -594,10 +594,11 @@ async def on_message(message: discord.Message):
         )
         row = cur.fetchone()
         if not row:
+            # not a Stylo ticket, process normal commands
             await bot.process_commands(message)
             return
 
-        # Accept images from ANYONE in the ticket (admins can upload on behalf)
+        # ---------- image detection ----------
         def is_image(att: discord.Attachment) -> bool:
             if att.content_type and att.content_type.startswith("image/"):
                 return True
@@ -605,25 +606,39 @@ async def on_message(message: discord.Message):
             ext  = name.rsplit(".", 1)[-1] if "." in name else ""
             return ext in {"png","jpg","jpeg","gif","webp","heic","heif","bmp","tif","tiff"}
 
-        img_url = next((a.url for a in message.attachments if is_image(a)), None)
-        if not img_url:
+        img_att = next((a for a in message.attachments if is_image(a)), None)
+        if not img_att:
             await bot.process_commands(message)
             return
 
-        cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (img_url, row["entrant_id"]))
+        # ---------- read user's upload ----------
+        img_bytes = await img_att.read()
+
+        # ---------- re-upload as bot (so deletions don't break URLs) ----------
+        bot_file = discord.File(io.BytesIO(img_bytes), filename=img_att.filename or "entry.png")
+        bot_msg = await message.channel.send(
+            content=(
+                f"📸 Entry updated for <@{message.author.id}>.\n"
+                f"Your most recent image will be used for Stylo."
+            ),
+            file=bot_file
+        )
+        bot_url = bot_msg.attachments[0].url if bot_msg.attachments else img_att.url
+
+        # ---------- save NEW url ----------
+        cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (bot_url, row["entrant_id"]))
         con.commit()
 
+        # react on the user's message too (feedback)
         try:
             await message.add_reaction("✅")
         except:
             pass
-        try:
-            await message.channel.send(f"Saved your entry, {message.author.mention}! Your latest image will be used.")
-        except:
-            pass
+
     finally:
         con.close()
         await bot.process_commands(message)
+
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
@@ -958,11 +973,12 @@ async def stylo_set_round_time_left(inter: discord.Interaction, minutes: int):
 
 
 # ---------------- Scheduler ----------------
+# ---------------- Scheduler ----------------
 @tasks.loop(seconds=20)
 async def scheduler():
     now = datetime.now(timezone.utc)
 
-    # ENTRY -> VOTING
+    # ========== 1) ENTRY -> VOTING ==========
     try:
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='entry'")
@@ -996,6 +1012,7 @@ async def scheduler():
             ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
 
             if len(entrants) < 2:
+                # not enough to start
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
                 con.commit()
                 if guild:
@@ -1014,6 +1031,7 @@ async def scheduler():
                         pass
                 continue
 
+            # build Round 1 pairs
             random.shuffle(entrants)
             pairs = []
             for i in range(0, len(entrants), 2):
@@ -1031,6 +1049,7 @@ async def scheduler():
                 )
             con.commit()
 
+            # update event to voting
             cur.execute(
                 "UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
                 (round_index, vote_end.isoformat(), ev["main_channel_id"], ev["guild_id"])
@@ -1052,7 +1071,7 @@ async def scheduler():
                         pass
                 except:
                     pass
-           
+
             # announce + lock
             if ch:
                 try:
@@ -1062,15 +1081,15 @@ async def scheduler():
                                     "Main chat is now **locked** — use each match thread for hype 💬.",
                         colour=EMBED_COLOUR
                     ))
-            
+
                     # Lock the main chat for the entire voting duration
                     await ch.set_permissions(guild.default_role, send_messages=False)
                     print(f"[stylo] Locked main channel {ch.name} in guild {guild.name} (Round {round_index})")
-            
+
                 except Exception as e:
                     print(f"[stylo] Failed to announce/lock chat: {e!r}")
 
-            # post every Round 1 match (images guaranteed)
+            # post every Round 1 match
             await post_round_matches(ev, round_index, vote_end, con, cur)
 
             # delete tickets AFTER posting matches
@@ -1086,7 +1105,7 @@ async def scheduler():
         print(f"[stylo] ERROR entry->voting: {e!r}")
         traceback.print_exc(file=sys.stderr)
 
-    # -------------- VOTING END -> RESULTS / NEXT ROUND / CHAMPION --------------
+    # ========== 2) VOTING END -> RESULTS / NEXT ROUND / CHAMPION ==========
     try:
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='voting'")
@@ -1105,6 +1124,7 @@ async def scheduler():
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
             any_revote = False
 
+            # ----- resolve matches in this round -----
             for m in matches:
                 L = m["left_votes"]; R = m["right_votes"]
                 cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); LNrow = cur.fetchone()
@@ -1112,6 +1132,7 @@ async def scheduler():
                 LN = (LNrow["name"] if LNrow else "Left"); RN = (RNrow["name"] if RNrow else "Right")
 
                 if L == R:
+                    # tie -> re-vote
                     any_revote = True
                     new_end = now + timedelta(seconds=vote_sec)
                     cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
@@ -1168,8 +1189,6 @@ async def scheduler():
                             description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n🏆 **Winner:** {winner_mention}",
                             colour=discord.Colour.green()
                         )
-
-                        # Attach winner image so it shows outside the private ticket
                         file = None
                         wurl = (wrow["image_url"] or "").strip() if wrow else ""
                         if wurl:
@@ -1185,6 +1204,7 @@ async def scheduler():
                     except Exception as ex:
                         print("[stylo] result send error:", ex)
 
+            # if any match was re-voted, just extend that round and skip building the next one
             if any_revote:
                 cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
                             (ev["guild_id"], ev["round_index"]))
@@ -1195,7 +1215,85 @@ async def scheduler():
                     con.commit()
                 continue
 
-            # unlock main chat
+            # ----- NEW: universal odd-fix (1 leftover -> special match) -----
+            # 1) get everyone with a real image
+            cur.execute(
+                "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
+                (ev["guild_id"],)
+            )
+            all_valid_ids = {r["id"] for r in cur.fetchall()}
+
+            # 2) get everyone who actually fought in THIS round
+            cur.execute(
+                "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
+                (ev["guild_id"], ev["round_index"])
+            )
+            fought_ids = set()
+            for r in cur.fetchall():
+                fought_ids.add(r["left_id"])
+                fought_ids.add(r["right_id"])
+
+            leftover_ids = list(all_valid_ids - fought_ids)
+            created_special = False
+
+            if len(leftover_ids) == 1 and len(winners) >= 1:
+                leftover_id = leftover_ids[0]
+
+                # pick best loser from THIS round
+                best_loser_id = None
+                best_loser_votes = -1
+
+                for (match_id, winner_id, LN, RN, L, R) in winners:
+                    cur.execute("SELECT left_id, right_id FROM match WHERE id=?", (match_id,))
+                    mrow = cur.fetchone()
+                    if not mrow:
+                        continue
+
+                    if winner_id == mrow["left_id"]:
+                        loser_id = mrow["right_id"]
+                        loser_votes = R
+                    else:
+                        loser_id = mrow["left_id"]
+                        loser_votes = L
+
+                    if loser_id == leftover_id:
+                        continue
+
+                    if loser_votes > best_loser_votes:
+                        best_loser_votes = loser_votes
+                        best_loser_id = loser_id
+
+                if best_loser_id is not None:
+                    special_round = ev["round_index"] + 1
+                    vote_end = now + timedelta(seconds=vote_sec)
+
+                    cur.execute(
+                        "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                        (ev["guild_id"], special_round, leftover_id, best_loser_id, vote_end.isoformat())
+                    )
+                    con.commit()
+
+                    cur.execute(
+                        "UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
+                        (special_round, vote_end.isoformat(), ev["guild_id"])
+                    )
+                    con.commit()
+
+                    if ch:
+                        await ch.send(embed=discord.Embed(
+                            title="🆚 Stylo — Special Match",
+                            description="Odd number of looks, so the unpaired look is battling the strongest non-winner. Winner advances.",
+                            colour=EMBED_COLOUR
+                        ))
+
+                    await post_round_matches(ev, special_round, vote_end, con, cur)
+                    created_special = True
+
+            if created_special:
+                continue
+            # ----- END: universal odd-fix -----
+
+            # unlock main chat (we're about to either close or start new round)
             if ch and guild:
                 try:
                     await ch.set_permissions(guild.default_role, send_messages=True)
@@ -1209,88 +1307,6 @@ async def scheduler():
                 con.commit()
 
                 cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (champ_id,))
-                w = cur.fetchone()
-                winner_name = (w["name"] if w else "Unknown")
-                em = discord.Embed(
-                    title=f"👑 Stylo Champion — {ev['theme']}",
-                    description=f"Winner by public vote: **{winner_name}**" + (f"\n<@{w['user_id']}>" if w and w["user_id"] else ""),
-                    colour=discord.Colour.gold()
-                )
-
-                file = None
-                wurl = (w["image_url"] or "").strip() if w else ""
-                if wurl:
-                    data = await fetch_image_bytes(wurl)
-                    if data:
-                        file = discord.File(io.BytesIO(data), filename="champion.png")
-                        em.set_image(url="attachment://champion.png")
-
-                if ch:
-                    if file:
-                        await ch.send(embed=em, file=file)
-                    else:
-                        await ch.send(embed=em)
-                continue
-
-                # Unlock main chat after the Champion is announced
-                if ch and guild:
-                    try:
-                        await ch.set_permissions(guild.default_role, send_messages=True)
-                        await ch.send("💬 Main chat is now open again — celebrate the Champion!")
-                        print("[stylo] Unlocked main chat after Champion announcement")
-                    except Exception as e:
-                        print(f"[stylo] Failed to unlock main chat: {e}")
-
-
-            # NEXT ROUND from winners
-            winner_ids = [w[1] for w in winners]
-            placeholders = ",".join("?" for _ in winner_ids)
-            cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
-            next_entrants = cur.fetchall()
-            random.shuffle(next_entrants)
-
-            next_pairs = []
-            for i in range(0, len(next_entrants), 2):
-                if i + 1 < len(next_entrants):
-                    next_pairs.append((next_entrants[i], next_entrants[i + 1]))
-
-            new_round = ev["round_index"] + 1
-            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-            vote_end = now + timedelta(seconds=vote_sec)
-
-            for L, R in next_pairs:
-                cur.execute(
-                    "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                    (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat())
-                )
-            con.commit()
-
-            cur.execute("UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
-                        (new_round, vote_end.isoformat(), ev["guild_id"]))
-            con.commit()
-
-            if ch:
-                await ch.send(embed=discord.Embed(
-                    title=f"🆚 Stylo — Round {new_round} begins!",
-                    description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\n"
-                                "Main chat is locked; use each match thread for hype.",
-                    colour=EMBED_COLOUR
-                ))
-                # Keep main chat locked for subsequent rounds
-                try:
-                    await ch.set_permissions(guild.default_role, send_messages=False)
-                    print(f"[stylo] Locked main chat for voting (Round {new_round})")
-                except Exception as e:
-                    print(f"[stylo] Failed to lock main chat: {e}")
-
-                # Post all matches for the new round with images
-                await post_round_matches(ev, new_round, vote_end, con, cur)
-
-        con.close()
-    except Exception as e:
-        import traceback, sys
-        print(f"[stylo] ERROR voting-end: {e!r}")
-        traceback.print_exc(file=sys.stderr)
 
 @scheduler.before_loop
 async def _wait_ready():
