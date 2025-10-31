@@ -713,16 +713,22 @@ async def stylo_cmd(inter: discord.Interaction):
         return
 
     try:
-        # send the modal straight away (this is the correct way for modals)
+        # ORIGINAL, correct way
         await inter.response.send_modal(StyloStartModal(inter))
     except discord.errors.NotFound:
-        # interaction expired / too slow
-        await inter.followup.send(
-            "That took too long, Discord dropped the interaction. Please run `/stylo` again.",
-            ephemeral=True,
-        )
+        # Discord said: Unknown interaction (10062) -> tell user to retry
+        try:
+            await inter.followup.send(
+                "That took a bit too long and Discord dropped it. Please run `/stylo` again.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
     except Exception as e:
-        await inter.followup.send(f"Couldn't open Stylo modal: {e!r}", ephemeral=True)
+        try:
+            await inter.followup.send(f"Couldn't open Stylo modal: {e!r}", ephemeral=True)
+        except Exception:
+            pass
 
 
 
