@@ -501,31 +501,39 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         super().__init__(); self._origin = inter
 
     async def on_submit(self, inter: discord.Interaction):
-        if not is_admin(inter.user):
-            await inter.response.send_message("Admins only.", ephemeral=True); return
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True); return
+    try:
         try:
-            try:
-                await inter.response.defer(ephemeral=False)
-            except discord.InteractionResponded:
-                pass
+            await inter.response.defer(ephemeral=False)
+        except discord.InteractionResponded:
+            pass
 
-            entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
-            vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
-            theme = str(self.theme).strip()
-            if not theme:
-                await inter.followup.send("Theme is required.", ephemeral=True); return
+        entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
+        vote_sec  = parse_duration_to_seconds(str(self.vote_hours),  default_unit="h")
+        theme = str(self.theme).strip()
+        if not theme:
+            await inter.followup.send("Theme is required.", ephemeral=True); return
 
-            now_utc = datetime.now(timezone.utc)
-            entry_end = now_utc + timedelta(seconds=entry_sec)
+        now_utc = datetime.now(timezone.utc)
+        entry_end = now_utc + timedelta(seconds=entry_sec)
 
-            con = db(); cur = con.cursor()
-            cur.execute(
-                "REPLACE INTO event (guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id, start_msg_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (inter.guild_id, theme, "entry", entry_end.isoformat(),
-                 int(round(vote_sec/3600)), int(vote_sec), 0, inter.channel_id, None)
-            )
-            con.commit(); con.close()
+        con = db(); cur = con.cursor()
+
+        cur.execute("DELETE FROM match   WHERE guild_id=?", (inter.guild_id,))
+        cur.execute("DELETE FROM ticket  WHERE entrant_id IN (SELECT id FROM entrant WHERE guild_id=?)", (inter.guild_id,))
+        cur.execute("DELETE FROM entrant WHERE guild_id=?", (inter.guild_id,))
+        con.commit()
+
+        # now write the new event
+        cur.execute(
+            "REPLACE INTO event (guild_id, theme, state, entry_end_utc, vote_hours, vote_seconds, round_index, main_channel_id, start_msg_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (inter.guild_id, theme, "entry", entry_end.isoformat(),
+             int(round(vote_sec/3600)), int(vote_sec), 0, inter.channel_id, None)
+        )
+        con.commit(); con.close()
+            #you can see this? 
 
             em = discord.Embed(
                 title=f"✨ Stylo: {theme}",
