@@ -1601,6 +1601,9 @@ async def _wait_ready():
 # ---------------- Ready ----------------
 @bot.event
 async def on_ready():
+    # make old "Join" buttons work after restart
+    bot.add_view(build_join_view(True))
+
     try:
         await bot.tree.sync()
         for g in bot.guilds:
@@ -1614,6 +1617,7 @@ async def on_ready():
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
