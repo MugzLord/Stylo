@@ -693,6 +693,270 @@ async def stylo_debug(inter: discord.Interaction):
     )
     await inter.response.send_message(msg, ephemeral=True)
 
+@bot.tree.command(name="stylo_finish_round_now", description="Force the current Stylo voting round to finish NOW and post winners. (admin)")
+async def stylo_finish_round_now(inter: discord.Interaction):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True)
+        return
+
+    await inter.response.defer(ephemeral=True)
+
+    now = datetime.now(timezone.utc)
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM event WHERE guild_id=? AND state='voting'", (inter.guild_id,))
+    ev = cur.fetchone()
+    if not ev:
+        con.close()
+        await inter.followup.send("No Stylo round in voting state for this guild.", ephemeral=True)
+        return
+
+    guild = inter.guild
+    ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
+
+    # pretend the round has ended
+    cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+                (ev["guild_id"], ev["round_index"]))
+    matches = cur.fetchall()
+    winners = []
+    vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+    any_revote = False
+
+    for m in matches:
+        L = m["left_votes"]; R = m["right_votes"]
+        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["left_id"],)); Lrow = cur.fetchone()
+        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["right_id"],)); Rrow = cur.fetchone()
+        LN = (Lrow["name"] if Lrow else "Left")
+        RN = (Rrow["name"] if Rrow else "Right")
+
+        # ---- tie handling (same as we wanted) ----
+        if L == R:
+            if L == 0 and R == 0:
+                # auto pick
+                chosen_id = random.choice([m["left_id"], m["right_id"]])
+                cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+                            (chosen_id, now.isoformat(), m["id"]))
+                con.commit()
+                winners.append((m["id"], chosen_id, LN, RN, L, R))
+
+                # announce
+                if ch:
+                    try:
+                        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (chosen_id,))
+                        wrow = cur.fetchone()
+                        wname = wrow["name"] if wrow else "Unknown"
+                        em = discord.Embed(
+                            title=f"🏁 Result — {LN} vs {RN}",
+                            description=f"No votes were cast, so winner picked automatically.\n🏆 **Winner:** {wname}" + (f" (<@{wrow['user_id']}>)" if wrow and wrow["user_id"] else ""),
+                            colour=discord.Colour.green()
+                        )
+                        if wrow and (wrow["image_url"] or "").strip():
+                            data = await fetch_image_bytes(wrow["image_url"])
+                            if data:
+                                file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
+                                em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
+                                await ch.send(embed=em, file=file)
+                            else:
+                                await ch.send(embed=em)
+                        else:
+                            await ch.send(embed=em)
+                    except Exception as ex:
+                        print("[stylo_finish] auto tie announce err:", ex)
+                continue
+
+            # real tie with votes -> re-vote
+            any_revote = True
+            new_end = now + timedelta(seconds=vote_sec)
+            cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                        (new_end.isoformat(), m["id"]))
+            cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
+            con.commit()
+
+            if ch and m["msg_id"]:
+                try:
+                    msg = await ch.fetch_message(m["msg_id"])
+                    em = msg.embeds[0] if msg.embeds else discord.Embed(
+                        title=f"Round {ev['round_index']} — {LN} vs {RN}",
+                        description="Tap a button to vote. One vote per person.",
+                        colour=EMBED_COLOUR
+                    )
+                    if em.fields:
+                        em.set_field_at(0, name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                    else:
+                        em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                    view = MatchView(m["id"], new_end, LN, RN)
+                    await msg.edit(embed=em, view=view)
+                except:
+                    pass
+
+            if ch:
+                try:
+                    await ch.send(embed=discord.Embed(
+                        title=f"🔁 Tie-break — {LN} vs {RN}",
+                        description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
+                        colour=discord.Colour.orange()
+                    ))
+                except:
+                    pass
+            # go to next match
+            continue
+
+        # ---- normal winner ----
+        winner_id = m["left_id"] if L > R else m["right_id"]
+        cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+                    (winner_id, now.isoformat(), m["id"]))
+        con.commit()
+        winners.append((m["id"], winner_id, LN, RN, L, R))
+
+        total = max(1, L + R)
+        pL = round((L / total) * 100, 1)
+        pR = round((R / total) * 100, 1)
+
+        if ch:
+            try:
+                cur.execute("SELECT user_id, image_url FROM entrant WHERE id=?", (winner_id,))
+                wrow = cur.fetchone()
+                winner_mention = (f"<@{wrow['user_id']}>" if wrow and wrow["user_id"] else "the winner")
+                em = discord.Embed(
+                    title=f"🏁 Result — {LN} vs {RN}",
+                    description=f"**{LN}**: {L} ({pL}%)\n**{RN}**: {R} ({pR}%)\n\n🏆 **Winner:** {winner_mention}",
+                    colour=discord.Colour.green()
+                )
+                file = None
+                wurl = (wrow["image_url"] or "").strip() if wrow else ""
+                if wurl:
+                    data = await fetch_image_bytes(wurl)
+                    if data:
+                        file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
+                        em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
+                if file:
+                    await ch.send(embed=em, file=file)
+                else:
+                    await ch.send(embed=em)
+            except Exception as ex:
+                print("[stylo_finish] result send err:", ex)
+
+    # if any match was re-voted, just extend that round
+    if any_revote:
+        # set event end to latest match end
+        cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
+                    (ev["guild_id"], ev["round_index"]))
+        mx = cur.fetchone()["mx"]
+        if mx:
+            cur.execute("UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                        (mx, ev["guild_id"]))
+            con.commit()
+        con.close()
+        await inter.followup.send("Some matches were tied — re-votes opened. Others were processed.", ephemeral=True)
+        return
+
+    # no re-votes -> proceed to next round / champion
+    # unlock main chat for a moment (your main scheduler also does this)
+    if ch and guild:
+        try:
+            await ch.set_permissions(guild.default_role, send_messages=True)
+        except:
+            pass
+
+    # champion if only 1 winner
+    if len(winners) == 1:
+        champ_id = winners[0][1]
+        cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+        con.commit()
+
+        cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (champ_id,))
+        w = cur.fetchone()
+        winner_name = (w["name"] if w else "Unknown")
+        em = discord.Embed(
+            title=f"👑 Stylo Champion — {ev['theme']}",
+            description=f"Winner by public vote: **{winner_name}**" + (f"\n<@{w['user_id']}>" if w and w["user_id"] else ""),
+            colour=discord.Colour.gold()
+        )
+        file = None
+        wurl = (w["image_url"] or "").strip() if w else ""
+        if wurl:
+            data = await fetch_image_bytes(wurl)
+            if data:
+                file = discord.File(io.BytesIO(data), filename="champion.png")
+                em.set_image(url="attachment://champion.png")
+
+        if ch:
+            if file:
+                await ch.send(embed=em, file=file)
+            else:
+                await ch.send(embed=em)
+
+        con.close()
+        await inter.followup.send("Round finished and Champion announced. ✅", ephemeral=True)
+        return
+
+    # build next round from these winners
+    winner_ids = [w[1] for w in winners]
+    placeholders = ",".join("?" for _ in winner_ids)
+    cur.execute(f"SELECT * FROM entrant WHERE id IN ({placeholders})", winner_ids)
+    next_entrants = cur.fetchall()
+    random.shuffle(next_entrants)
+
+    next_pairs = []
+    for i in range(0, len(next_entrants), 2):
+        if i + 1 < len(next_entrants):
+            next_pairs.append((next_entrants[i], next_entrants[i + 1]))
+
+    new_round = ev["round_index"] + 1
+    vote_end = now + timedelta(seconds=vote_sec)
+
+    for L, R in next_pairs:
+        cur.execute(
+            "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+            (ev["guild_id"], new_round, L["id"], R["id"], vote_end.isoformat())
+        )
+    con.commit()
+
+    cur.execute("UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
+                (new_round, vote_end.isoformat(), ev["guild_id"]))
+    con.commit()
+
+    if ch:
+        await ch.send(embed=discord.Embed(
+            title=f"🆚 Stylo — Round {new_round} begins!",
+            description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\nMain chat is locked; use each match thread for hype.",
+            colour=EMBED_COLOUR
+        ))
+        try:
+            await ch.set_permissions(guild.default_role, send_messages=False)
+        except Exception as e:
+            print("[stylo_finish] failed to lock main chat:", e)
+
+        # post matches for this new round
+        await post_round_matches(ev, new_round, vote_end, con, cur)
+
+    con.close()
+    await inter.followup.send("Round finished, next round posted. ✅", ephemeral=True)
+
+@bot.tree.command(name="stylo_set_round_time_left", description="Shorten or extend the CURRENT Stylo voting round (admin).")
+async def stylo_set_round_time_left(inter: discord.Interaction, minutes: int):
+    if not is_admin(inter.user):
+        await inter.response.send_message("Admins only.", ephemeral=True)
+        return
+
+    if minutes < 1:
+        minutes = 1
+
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM event WHERE guild_id=? AND state='voting'", (inter.guild_id,))
+    ev = cur.fetchone()
+    if not ev:
+        con.close()
+        await inter.response.send_message("No Stylo round currently in voting state.", ephemeral=True)
+        return
+
+    new_end = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    cur.execute("UPDATE event SET entry_end_utc=? WHERE guild_id=?", (new_end.isoformat(), inter.guild_id))
+    con.commit(); con.close()
+
+    await inter.response.send_message(f"⏱ Current round will now end in **{minutes} minutes**.", ephemeral=True)
+
+
+
 # ---------------- Scheduler ----------------
 @tasks.loop(seconds=20)
 async def scheduler():
