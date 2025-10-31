@@ -712,15 +712,18 @@ async def stylo_cmd(inter: discord.Interaction):
         await inter.response.send_message("Admins only.", ephemeral=True)
         return
 
-    # 1) acknowledge immediately so Discord doesn't 404 us
-    await inter.response.defer(ephemeral=True)
-
-    # 2) now send the modal via followup
     try:
-        await inter.followup.send_modal(StyloStartModal(inter))
+        # send the modal straight away (this is the correct way for modals)
+        await inter.response.send_modal(StyloStartModal(inter))
+    except discord.errors.NotFound:
+        # interaction expired / too slow
+        await inter.followup.send(
+            "That took too long, Discord dropped the interaction. Please run `/stylo` again.",
+            ephemeral=True,
+        )
     except Exception as e:
-        # just in case
         await inter.followup.send(f"Couldn't open Stylo modal: {e!r}", ephemeral=True)
+
 
 
 @bot.tree.command(name="stylo_set_ticket_category", description="Set the category for entry tickets (admin only).")
