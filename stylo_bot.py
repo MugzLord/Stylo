@@ -1033,13 +1033,13 @@ async def scheduler():
         con = db(); cur = con.cursor()
         cur.execute("SELECT * FROM event WHERE state='entry'")
         for ev in cur.fetchall():
-            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
             if now < entry_end:
                 continue
 
             guild = bot.get_guild(ev["guild_id"])
 
-            # backfill missing images from tickets
+            # 1) hard backfill missing images from tickets BEFORE we judge
             if guild:
                 cur.execute("SELECT id, image_url FROM entrant WHERE guild_id=?", (ev["guild_id"],))
                 for e in cur.fetchall():
@@ -1052,33 +1052,54 @@ async def scheduler():
                         except Exception as ex:
                             print(f"[stylo] backfill image failed for entrant {e['id']}: {ex!r}")
 
-            # only entrants with image
+            # 2) now read entrants with real images (1st pass)
             cur.execute(
                 "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
                 (ev["guild_id"],)
             )
             entrants = cur.fetchall()
 
-            ch = (guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"])
-                  else (guild.system_channel if guild else None))
+            # 3) if still <2, do one more HARD scan of all tickets (race-condition fix)
+            if len(entrants) < 2 and guild:
+                try:
+                    cur.execute("SELECT id FROM entrant WHERE guild_id=?", (ev["guild_id"],))
+                    for e in cur.fetchall():
+                        url = await fetch_latest_ticket_image_url(guild, e["id"])
+                        if url:
+                            cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (url, e["id"]))
+                    con.commit()
+                except Exception as ex:
+                    print(f"[stylo] hard backfill (entry->voting) failed: {ex!r}")
 
+                # re-read
+                cur.execute(
+                    "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
+                    (ev["guild_id"],)
+                )
+                entrants = cur.fetchall()
+
+            # channel to talk in
+            ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
+
+            # 4) final decision
             if len(entrants) < 2:
-                # not enough -> close
+                # close/cancel gracefully
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
                 con.commit()
                 if ch:
                     try:
                         await ch.send(embed=discord.Embed(
                             title="⛔ Stylo cancelled",
-                            description="Entries closed with fewer than two valid images.",
+                            description=f"Entries closed, but I only found **{len(entrants)}** valid image(s).",
                             colour=discord.Colour.red()
                         ))
+                        if guild:
+                            await ch.set_permissions(guild.default_role, send_messages=True)
                     except:
                         pass
-                # DO NOT delete tickets here anymore
                 continue
 
-            # build round 1
+            # 5) we have at least 2 -> make pairs
             random.shuffle(entrants)
             pairs = []
             for i in range(0, len(entrants), 2):
@@ -1089,6 +1110,7 @@ async def scheduler():
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
             vote_end = now + timedelta(seconds=vote_sec)
 
+            # insert matches
             for L, R in pairs:
                 cur.execute(
                     "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
@@ -1096,7 +1118,7 @@ async def scheduler():
                 )
             con.commit()
 
-            # move event to voting
+            # update event to voting
             cur.execute(
                 "UPDATE event SET state='voting', round_index=?, entry_end_utc=?, main_channel_id=? WHERE guild_id=?",
                 (round_index, vote_end.isoformat(), ev["main_channel_id"], ev["guild_id"])
