@@ -1559,7 +1559,17 @@ async def scheduler():
                     con.commit()
                 continue
 
-            # ----- ODD-FIX (per-round): at most 1 extra match to make it even -----
+            
+            # ----- at this point, ALL matches in this round that could finish have finished
+            # BUT: we may have finished only 1 match *this tick* while others were already finished earlier.
+            # We must look at ALL winners in this round, not just `winners` from above.
+            cur.execute(
+                "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
+                (ev["guild_id"], ev["round_index"])
+            )
+            all_winners_this_round = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
+
+            # we also need to know who actually fought this round (to detect leftovers later)
             cur.execute(
                 "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
                 (ev["guild_id"], ev["round_index"])
@@ -1569,7 +1579,16 @@ async def scheduler():
                 fought_ids.add(r["left_id"])
                 fought_ids.add(r["right_id"])
 
-            winner_ids_this_round = {w[1] for w in winners}
+            # get ALL valid entrants for this event (people with image)
+            cur.execute(
+                "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
+                (ev["guild_id"],)
+            )
+            all_event_ids = {r["id"] for r in cur.fetchall()}
+
+            # leftover = people in event but not in this round's matches and not already winners
+            leftover_ids = list(all_event_ids - fought_ids - set(all_winners_this_round))
+
 
             cur.execute(
                 "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
@@ -1654,9 +1673,10 @@ async def scheduler():
                 except:
                     pass
 
-            # ----- CHAMPION? -----
-            if len(winners) == 1:
-                champ_id = winners[0][1]
+            # ----- CHAMPION? (real one) -----
+            # champion only if after resolving this round we truly have 1 person advancing
+            if len(all_winners_this_round) == 1 and not leftover_ids:
+                champ_id = all_winners_this_round[0]
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
                 con.commit()
 
@@ -1681,7 +1701,7 @@ async def scheduler():
                     else:
                         await ch.send(embed=em)
 
-                # NOW we can delete tickets
+                # delete tickets at the real end
                 if guild:
                     try:
                         await cleanup_tickets_for_guild(guild, reason="Stylo: finished - deleting tickets")
