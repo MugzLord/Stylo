@@ -1551,11 +1551,16 @@ async def scheduler():
             )
             all_winners_this_round = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
 
+            # who actually fought in this round (build once!)
             cur.execute(
-                "SELECT left_id,right_id FROM match WHERE guild_id=? AND round_index=?",
+                "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
                 (ev["guild_id"], ev["round_index"])
             )
-            fought_ids = {r["left_id"] for r in cur.fetchall()} | {r["right_id"] for r in cur.fetchall()}
+            fought_ids = set()
+            rows = cur.fetchall()
+            for r in rows:
+                fought_ids.add(r["left_id"])
+                fought_ids.add(r["right_id"])
 
             cur.execute(
                 "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url)<>''",
