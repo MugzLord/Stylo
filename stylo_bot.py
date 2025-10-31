@@ -709,8 +709,19 @@ async def on_message(message: discord.Message):
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
 async def stylo_cmd(inter: discord.Interaction):
     if not is_admin(inter.user):
-        await inter.response.send_message("Admins only.", ephemeral=True); return
-    await inter.response.send_modal(StyloStartModal(inter))
+        await inter.response.send_message("Admins only.", ephemeral=True)
+        return
+
+    # 1) acknowledge immediately so Discord doesn't 404 us
+    await inter.response.defer(ephemeral=True)
+
+    # 2) now send the modal via followup
+    try:
+        await inter.followup.send_modal(StyloStartModal(inter))
+    except Exception as e:
+        # just in case
+        await inter.followup.send(f"Couldn't open Stylo modal: {e!r}", ephemeral=True)
+
 
 @bot.tree.command(name="stylo_set_ticket_category", description="Set the category for entry tickets (admin only).")
 @app_commands.describe(category="Pick a category where ticket channels will be created.")
