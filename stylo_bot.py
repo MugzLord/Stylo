@@ -1290,51 +1290,34 @@ async def scheduler():
                             print(f"[stylo] backfill image failed for entrant {e['id']}: {ex!r}")
 
             # 2) now read entrants with real images (1st pass)
-            cur.execute(
-                "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
-                (ev["guild_id"],)
-            )
-            entrants = cur.fetchall()
-
-            # 3) if still <2, do one more HARD scan of all tickets (race-condition fix)
-            if len(entrants) < 2 and guild:
-                try:
-                    cur.execute("SELECT id FROM entrant WHERE guild_id=?", (ev["guild_id"],))
-                    for e in cur.fetchall():
-                        url = await fetch_latest_ticket_image_url(guild, e["id"])
-                        if url:
-                            cur.execute("UPDATE entrant SET image_url=? WHERE id=?", (url, e["id"]))
-                    con.commit()
-                except Exception as ex:
-                    print(f"[stylo] hard backfill (entry->voting) failed: {ex!r}")
-
-                # re-read
-                cur.execute(
-                    "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
-                    (ev["guild_id"],)
-                )
-                entrants = cur.fetchall()
-
-            # channel to talk in
-            ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
-
             # 4) final decision
+            # count ALL entrants (even if they didn't manage to upload in time)
+            cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (ev["guild_id"],))
+            total_entrants = cur.fetchone()["c"] or 0
+
             if len(entrants) < 2:
-                # close/cancel gracefully
-                cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
-                con.commit()
-                if ch:
-                    try:
-                        await ch.send(embed=discord.Embed(
-                            title="⛔ Stylo cancelled",
-                            description=f"Entries closed, but I only found **{len(entrants)}** valid image(s).",
-                            colour=discord.Colour.red()
-                        ))
-                        if guild:
-                            await ch.set_permissions(guild.default_role, send_messages=True)
-                    except:
-                        pass
-                continue
+                if total_entrants >= 2:
+                    # 📌 we have 2+ people but not all uploaded images -> STILL run the bracket
+                    # use everyone, images will show "No image found" if missing
+                    cur.execute("SELECT * FROM entrant WHERE guild_id=?", (ev["guild_id"],))
+                    entrants = cur.fetchall()
+                else:
+                    # really not enough people -> cancel
+                    cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+                    con.commit()
+                    if ch:
+                        try:
+                            await ch.send(embed=discord.Embed(
+                                title="⛔ Stylo cancelled",
+                                description="Entries closed but I didn’t get enough looks to start.",
+                                colour=discord.Colour.red()
+                            ))
+                            if guild:
+                                await ch.set_permissions(guild.default_role, send_messages=True)
+                        except:
+                            pass
+                    continue
+
 
             # 5) we have at least 2 -> make pairs
             random.shuffle(entrants)
