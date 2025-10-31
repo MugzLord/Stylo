@@ -25,9 +25,12 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # ---------------- DB helpers ----------------
 def db():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
     con.row_factory = sqlite3.Row
+    # optional but nice:
+    con.execute("PRAGMA journal_mode=WAL;")
     return con
+
 
 def init_db():
     con = db()
@@ -971,6 +974,32 @@ async def stylo_set_round_time_left(inter: discord.Interaction, minutes: int):
     await inter.response.send_message(f"⏱ Current round will now end in **{minutes} minutes**.", ephemeral=True)
 
 
+# ---------------- ticket helpers for scheduler ----------------
+async def lock_tickets_for_guild(guild: discord.Guild):
+    """Make all Stylo tickets read-only (keep them for image recovery)."""
+    if not guild:
+        return
+    con = db(); cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT t.channel_id FROM ticket t JOIN entrant e ON e.id=t.entrant_id WHERE e.guild_id=?",
+            (guild.id,)
+        )
+        rows = cur.fetchall()
+        for r in rows:
+            ch = guild.get_channel(r["channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    # block everyone from chatting
+                    await ch.set_permissions(guild.default_role, send_messages=False)
+                    # bot can still talk
+                    await ch.set_permissions(guild.me, send_messages=True, attach_files=True, read_message_history=True)
+                except:
+                    pass
+    finally:
+        con.close()
+
+
 # ---------------- Scheduler ----------------
 @tasks.loop(seconds=20)
 async def scheduler():
@@ -1014,11 +1043,6 @@ async def scheduler():
                 # not enough -> close
                 cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
                 con.commit()
-                if guild:
-                    try:
-                        await cleanup_tickets_for_guild(guild, reason="Stylo: entries ended (<2 images)")
-                    except:
-                        pass
                 if ch:
                     try:
                         await ch.send(embed=discord.Embed(
@@ -1028,6 +1052,7 @@ async def scheduler():
                         ))
                     except:
                         pass
+                # DO NOT delete tickets here anymore
                 continue
 
             # build round 1
@@ -1072,7 +1097,7 @@ async def scheduler():
                     pass
 
             # announce + lock
-            if ch:
+            if ch and guild:
                 try:
                     await ch.send(embed=discord.Embed(
                         title=f"🆚 Stylo — Round {round_index} begins!",
@@ -1080,7 +1105,6 @@ async def scheduler():
                                     "Main chat is now **locked** — use each match thread for hype 💬.",
                         colour=EMBED_COLOUR
                     ))
-                    # lock
                     await ch.set_permissions(guild.default_role, send_messages=False)
                 except Exception as e:
                     print(f"[stylo] Failed to announce/lock chat: {e!r}")
@@ -1088,10 +1112,10 @@ async def scheduler():
             # post round 1 matches
             await post_round_matches(ev, round_index, vote_end, con, cur)
 
-            # delete tickets after posting
+            # instead of deleting tickets, just lock them
             if guild:
                 try:
-                    await cleanup_tickets_for_guild(guild, reason="Stylo: entries closed - deleting tickets")
+                    await lock_tickets_for_guild(guild)
                 except:
                     pass
 
@@ -1130,7 +1154,6 @@ async def scheduler():
                 LN = (LNrow["name"] if LNrow else "Left"); RN = (RNrow["name"] if RNrow else "Right")
 
                 if L == R:
-                    # tie -> re-vote
                     any_revote = True
                     new_end = now + timedelta(seconds=vote_sec)
                     cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
@@ -1201,7 +1224,6 @@ async def scheduler():
                     except Exception as ex:
                         print("[stylo] result send error:", ex)
 
-            # if any re-vote, extend round and skip
             if any_revote:
                 cur.execute("SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
                             (ev["guild_id"], ev["round_index"]))
@@ -1221,8 +1243,7 @@ async def scheduler():
 
             cur.execute(
                 "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
-                (ev["guild_id"], ev["round_index"])
-            )
+                (ev["guild_id"], ev["round_index"]))
             fought_ids = set()
             for r in cur.fetchall():
                 fought_ids.add(r["left_id"]); fought_ids.add(r["right_id"])
@@ -1318,6 +1339,14 @@ async def scheduler():
                         await ch.send(embed=em, file=file)
                     else:
                         await ch.send(embed=em)
+
+                # NOW we can delete tickets
+                if guild:
+                    try:
+                        await cleanup_tickets_for_guild(guild, reason="Stylo: finished - deleting tickets")
+                    except:
+                        pass
+
                 continue
 
             # ----- NORMAL NEXT ROUND -----
@@ -1348,10 +1377,11 @@ async def scheduler():
                                 "Main chat is locked; use each match thread for hype.",
                     colour=EMBED_COLOUR
                 ))
-                try:
-                    await ch.set_permissions(guild.default_role, send_messages=False)
-                except Exception as e:
-                    print("[stylo] Failed to lock main chat:", e)
+                if guild:
+                    try:
+                        await ch.set_permissions(guild.default_role, send_messages=False)
+                    except Exception as e:
+                        print("[stylo] Failed to lock main chat:", e)
 
                 await post_round_matches(ev, new_round, vote_end, con, cur)
 
@@ -1365,6 +1395,7 @@ async def scheduler():
 @scheduler.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
+
 
 # ---------------- Ready ----------------
 @bot.event
