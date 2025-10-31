@@ -178,16 +178,9 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 description="Tap a button to vote. One vote per person.",
                 colour=EMBED_COLOUR
             )
-            em.add_field(
-                name="Live totals",
-                value="Total votes: **0**\nSplit: **0% / 0%**",
-                inline=False
-            )
-            em.add_field(
-                name="Closes",
-                value=rel_ts(vote_end),
-                inline=False
-            )
+            # no percentages in the embed
+            em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
+            em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
             view = MatchView(m["id"], vote_end, L["name"], R["name"])
 
             msg = None
@@ -409,21 +402,33 @@ class MatchView(discord.ui.View):
             except:
                 pass
 
+        
+        # update the message without percentages
         if interaction.message and interaction.message.embeds:
             em = interaction.message.embeds[0]
             if em.fields:
-                em.set_field_at(0, name="Live totals", value=f"Total votes: **{total}**\nSplit: **{pa}% / {pb}%**", inline=False)
+                em.set_field_at(0, name="Live totals", value=f"Total votes: **{total}**", inline=False)
             else:
-                em.add_field(name="Live totals", value=f"Total votes: **{total}**\nSplit: **{pa}% / {pb}%**", inline=False)
+                em.add_field(name="Live totals", value=f"Total votes: **{total}**", inline=False)
             await interaction.response.edit_message(embed=em, view=self)
         else:
             await interaction.response.edit_message(view=self)
+        
+        # spicy banter based on the split we calculated above
+        if total >= 2:
+            if pa >= 80:
+                banter = "That’s a rinse. 🧽"
+            elif pa >= 65:
+                banter = "Crowd’s leaning that way 😏"
+            elif 45 <= pa <= 55:
+                banter = "Neck and neck, don’t blink 👀"
+            else:
+                banter = "You’re backing the underdog 🐶"
+        else:
+            banter = "First vote always feels powerful, init? 💅"
+        
+        await interaction.followup.send(f"Vote registered. ✅\n{banter}", ephemeral=True)
 
-        await interaction.followup.send("Vote registered. ✅", ephemeral=True)
-
-    @discord.ui.button(style=discord.ButtonStyle.primary, custom_id="stylo:vote_left")
-    async def btn_left(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        await self._vote(interaction, "L")
 
     @discord.ui.button(style=discord.ButtonStyle.danger, custom_id="stylo:vote_right")
     async def btn_right(self, interaction: discord.Interaction, _btn: discord.ui.Button):
@@ -1188,11 +1193,16 @@ async def scheduler():
                                 colour=EMBED_COLOUR
                             )
                             if em.fields:
-                                em.set_field_at(0, name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                                em.set_field_at(0, name="Live totals", value="Total votes: **0**", inline=False)
                             else:
-                                em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                                em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
+                            
+                            # show the new closing time again
+                            em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
+                            
                             view = MatchView(m["id"], new_end, LN, RN)
                             await msg.edit(embed=em, view=view)
+
                         except:
                             pass
 
