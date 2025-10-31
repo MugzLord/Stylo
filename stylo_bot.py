@@ -145,47 +145,55 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
 
 # ---------------- helpers ----------------
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
-    """Post all matches for a round with images (composite if possible, attached files as fallback)."""
+    """Post all matches for a round.
+    HARD RULE: for every match with msg_id IS NULL we MUST create a message with buttons.
+    Images are best-effort only.
+    """
     guild = bot.get_guild(ev["guild_id"])
     ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
     if not (guild and ch):
         return
 
-    cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
-                (ev["guild_id"], round_index))
+    # get all matches for this round that are not yet posted
+    cur.execute(
+        "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
+        (ev["guild_id"], round_index)
+    )
     matches = cur.fetchall()
 
     for m in matches:
         try:
-            # entrants
-            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-            if not L or not R:
-                continue
+            # get entrants
+            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
+            L = cur.fetchone()
+            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
+            R = cur.fetchone()
 
-            Lurl = (L["image_url"] or "").strip()
-            Rurl = (R["image_url"] or "").strip()
+            # fallback names if missing
+            Lname = L["name"] if L else "Left"
+            Rname = R["name"] if R else "Right"
 
-            # last-chance recover (useful in R1)
+            # try to recover image urls from tickets if missing
+            Lurl = (L["image_url"] or "").strip() if L else ""
+            Rurl = (R["image_url"] or "").strip() if R else ""
             if not Lurl and guild:
                 Lurl = await fetch_latest_ticket_image_url(guild, m["left_id"]) or ""
             if not Rurl and guild:
                 Rurl = await fetch_latest_ticket_image_url(guild, m["right_id"]) or ""
 
-            # header + buttons
+            # build base embed + view
             em = discord.Embed(
-                title=f"Round {round_index} — {L['name']} vs {R['name']}",
+                title=f"Round {round_index} — {Lname} vs {Rname}",
                 description="Tap a button to vote. One vote per person.",
                 colour=EMBED_COLOUR
             )
-            # no percentages in the embed
             em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
             em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
-            view = MatchView(m["id"], vote_end, L["name"], R["name"])
+            view = MatchView(m["id"], vote_end, Lname, Rname)
 
             msg = None
 
-            # 1) composite card
+            # 1) try nice composite card
             if Lurl and Rurl:
                 try:
                     card = await build_vs_card(Lurl, Rurl)
@@ -194,59 +202,93 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 except Exception as e:
                     print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
 
-            # 2) fallback: attach each image so they render
+            # 2) if composite failed, try two separate images
             if msg is None:
                 Lbytes = await fetch_image_bytes(Lurl) if Lurl else None
                 Rbytes = await fetch_image_bytes(Rurl) if Rurl else None
 
-                em_left  = discord.Embed(title=L['name'], colour=discord.Colour.dark_grey())
-                em_right = discord.Embed(title=R['name'], colour=discord.Colour.dark_grey())
+                # always send the header FIRST so we at least have buttons
+                header = await ch.send(embed=em, view=view)
+                msg = header
+
+                embeds = []
                 files = []
 
                 if Lbytes:
                     fL = discord.File(io.BytesIO(Lbytes), filename="left.png")
                     files.append(fL)
+                    em_left = discord.Embed(title=Lname, colour=discord.Colour.dark_grey())
                     em_left.set_image(url="attachment://left.png")
+                    embeds.append(em_left)
                 else:
-                    em_left.description = "No image saved."
+                    embeds.append(discord.Embed(
+                        title=Lname,
+                        description="No image found.",
+                        colour=discord.Colour.dark_grey()
+                    ))
 
                 if Rbytes:
                     fR = discord.File(io.BytesIO(Rbytes), filename="right.png")
                     files.append(fR)
+                    em_right = discord.Embed(title=Rname, colour=discord.Colour.dark_grey())
                     em_right.set_image(url="attachment://right.png")
+                    embeds.append(em_right)
                 else:
-                    em_right.description = "No image saved."
+                    embeds.append(discord.Embed(
+                        title=Rname,
+                        description="No image found.",
+                        colour=discord.Colour.dark_grey()
+                    ))
 
-                header = await ch.send(embed=em, view=view)
-                if files:
-                    await ch.send(embeds=[em_left, em_right], files=files)
-                else:
-                    await ch.send(embeds=[em_left, em_right])
-                msg = header
+                # only send extras if we actually have any
+                if embeds:
+                    if files:
+                        await ch.send(embeds=embeds, files=files)
+                    else:
+                        await ch.send(embeds=embeds)
 
-            # thread (best-effort)
+            # 3) best-effort thread
             thread_id = None
             try:
                 thread = await msg.create_thread(
-                    name=f"💬 {L['name']} vs {R['name']} — Chat", auto_archive_duration=1440
+                    name=f"💬 {Lname} vs {Rname} — Chat",
+                    auto_archive_duration=1440
                 )
                 await thread.send(embed=discord.Embed(
                     title="Supporter Chat",
-                    description="Talk here! Votes are via buttons on the parent post above.",
+                    description="Talk here — voting is on the parent post.",
                     colour=discord.Colour.dark_grey()
                 ))
                 thread_id = thread.id
             except Exception as e:
-                print(f"[stylo] create thread failed: {e!r}")
+                print(f"[stylo] create thread failed for match {m['id']}: {e!r}")
 
-            # keep EXACT indent here:
+            # 4) mark this match as posted
             cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
             con.commit()
-            await asyncio.sleep(0.3)
+
+            # little pause so Discord isn’t rushed
+            await asyncio.sleep(0.25)
 
         except Exception as e:
-            print(f"[stylo] posting match {m['id']} (round {round_index}) failed: {e!r}")
+            # even if EVERYTHING failed above, force a barebones message so voting is possible
+            print(f"[stylo] hard failure posting match {m['id']}: {e!r}")
+            try:
+                fallback_em = discord.Embed(
+                    title=f"Round {round_index} — Match {m['id']}",
+                    description="Images failed to load, but you can still vote.",
+                    colour=EMBED_COLOUR
+                )
+                fallback_em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
+                fallback_em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
+                fallback_view = MatchView(m["id"], vote_end, "Left", "Right")
+                fallback_msg = await ch.send(embed=fallback_em, view=fallback_view)
+                cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (fallback_msg.id, None, m["id"]))
+                con.commit()
+            except Exception as e2:
+                print(f"[stylo] EVEN FALLBACK failed for match {m['id']}: {e2!r}")
             continue
+
 
 async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
     """Scan the entrant's ticket channel for the newest image (best-effort)."""
