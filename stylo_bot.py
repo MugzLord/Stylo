@@ -165,34 +165,33 @@ async def send_stylo_status(
     entries_open: bool,
     join_enabled: bool,
 ):
-    """Post a fresh Stylo card at the bottom — works with sqlite.Row."""
-    if not ch:
+    # only post when entries are actually open
+    if not ch or not entries_open:
         return
 
-    # ev might be sqlite3.Row or a dict we made on the fly
-    theme = ev["theme"] if ("theme" in ev.keys()) else ev.get("theme", "Stylo")
+    # ev can be sqlite.Row or dict
+    if hasattr(ev, "keys"):
+        theme = ev["theme"]
+        end_iso = ev["entry_end_utc"]
+    else:
+        theme = ev.get("theme", "Stylo")
+        end_iso = ev["entry_end_utc"]
+
     title = f"✨ Stylo: {theme}" if theme else "✨ Stylo"
 
-    desc_lines = []
-    if entries_open:
-        end_iso = ev["entry_end_utc"]
-        dt = datetime.fromisoformat(end_iso).replace(tzinfo=timezone.utc)
-        desc_lines.append("Entries are **OPEN** ✨")
-        desc_lines.append(f"Close {rel_ts(dt)}")
-    else:
-        desc_lines.append("Entries are **CLOSED** ✅")
+    dt = datetime.fromisoformat(end_iso).replace(tzinfo=timezone.utc)
 
     em = discord.Embed(
         title=title,
-        description="\n".join(desc_lines),
+        description="\n".join([
+            "Entries are **OPEN** ✨",
+            f"Close {rel_ts(dt)}",
+        ]),
         colour=EMBED_COLOUR,
     )
-    view = build_join_view(join_enabled)
 
-    try:
-        await ch.send(embed=em, view=view)
-    except Exception as e:
-        print("[stylo] send_stylo_status failed:", e)
+    view = build_join_view(join_enabled)
+    await ch.send(embed=em, view=view)
 
 
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
@@ -851,11 +850,8 @@ async def on_message(message: discord.Message):
 
 
 async def maybe_bump_stylo_panel(message: discord.Message):
-    # only for guild text channels
     if not message.guild or not isinstance(message.channel, discord.TextChannel):
         return
-
-    # don't bump for bots
     if message.author.bot:
         return
 
@@ -873,23 +869,28 @@ async def maybe_bump_stylo_panel(message: discord.Message):
     if not ev:
         return
 
-    # only bump in the actual stylo channel
+    # only in the actual stylo channel
     if ev["main_channel_id"] != message.channel.id:
         return
 
+    # 🔴 only while entries are OPEN
+    if ev["state"] != "entry":
+        return
+
     cid = message.channel.id
-    current = stylo_chat_counters.get(cid, 0) + 1
-    stylo_chat_counters[cid] = current
+    count = stylo_chat_counters.get(cid, 0) + 1
+    stylo_chat_counters[cid] = count
 
-    if current >= STYLO_CHAT_BUMP_LIMIT:
-        stylo_chat_counters[cid] = 0  # reset
+    if count >= STYLO_CHAT_BUMP_LIMIT:
+        stylo_chat_counters[cid] = 0
+        await send_stylo_status(
+            message.guild,
+            message.channel,
+            ev,
+            entries_open=True,
+            join_enabled=True,
+        )
 
-        entries_open = (ev["state"] == "entry")
-        join_enabled = (ev["state"] == "entry")
-
-        guild = message.guild
-        ch = message.channel
-        await send_stylo_status(guild, ch, ev, entries_open, join_enabled)
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
@@ -1095,31 +1096,68 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                         description="Tap a button to vote. One vote per person.",
                         colour=EMBED_COLOUR
                     )
+            
+                    # field 0 = live totals
                     if em.fields:
                         em.set_field_at(0, name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
                     else:
                         em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-
-                    em.add_field(
-                        name="Closes",
-                        value=rel_ts(new_end),
-                        inline=False
-                    )
-
+            
+                    # find existing "Closes" field and update it, don’t stack
+                    closes_idx = None
+                    for idx, f in enumerate(em.fields):
+                        if f.name.lower() == "closes":
+                            closes_idx = idx
+                            break
+            
+                    if closes_idx is not None:
+                        em.set_field_at(closes_idx, name="Closes", value=rel_ts(new_end), inline=False)
+                    else:
+                        em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
+            
                     view = MatchView(m["id"], new_end, LN, RN)
                     await msg.edit(embed=em, view=view)
                 except:
                     pass
 
+            # optionally re-show both images WITH buttons for the re-vote
             if ch:
+                embeds = []
+                files = []
+            
+                # left
+                if Lrow and (Lrow["image_url"] or "").strip():
+                    Lbytes = await fetch_image_bytes(Lrow["image_url"])
+                    if Lbytes:
+                        fL = discord.File(io.BytesIO(Lbytes), filename="tie_left.png")
+                        files.append(fL)
+                        eL = discord.Embed(title=LN, colour=discord.Colour.dark_grey())
+                        eL.set_image(url="attachment://tie_left.png")
+                        embeds.append(eL)
+                else:
+                    embeds.append(discord.Embed(title=LN, description="No image found.", colour=discord.Colour.dark_grey()))
+            
+                # right
+                if Rrow and (Rrow["image_url"] or "").strip():
+                    Rbytes = await fetch_image_bytes(Rrow["image_url"])
+                    if Rbytes:
+                        fR = discord.File(io.BytesIO(Rbytes), filename="tie_right.png")
+                        files.append(fR)
+                        eR = discord.Embed(title=RN, colour=discord.Colour.dark_grey())
+                        eR.set_image(url="attachment://tie_right.png")
+                        embeds.append(eR)
+                else:
+                    embeds.append(discord.Embed(title=RN, description="No image found.", colour=discord.Colour.dark_grey()))
+            
                 try:
-                    await ch.send(embed=discord.Embed(
-                        title=f"🔁 Tie-break — {LN} vs {RN}",
-                        description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
-                        colour=discord.Colour.orange()
-                    ))
+                    view = MatchView(m["id"], new_end, LN, RN)
+                    if files:
+                        await ch.send(embeds=embeds, files=files, view=view)
+                    else:
+                        await ch.send(embeds=embeds, view=view)
                 except:
                     pass
+
             # go to next match
             continue
 
