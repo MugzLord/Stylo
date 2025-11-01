@@ -1044,50 +1044,17 @@ async def stylo_finish_round_now(inter: discord.Interaction):
 
         # ---- tie handling (same as we wanted) ----
         if L == R:
-            if L == 0 and R == 0:
-                # auto pick
-                chosen_id = random.choice([m["left_id"], m["right_id"]])
-                cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
-                            (chosen_id, now.isoformat(), m["id"]))
-                con.commit()
-                winners.append((m["id"], chosen_id, LN, RN, L, R))
-
-                # announce
-                if ch:
-                    try:
-                        cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (chosen_id,))
-                        wrow = cur.fetchone()
-                        wname = wrow["name"] if wrow else "Unknown"
-                        em = discord.Embed(
-                            title=f"🏁 Result — {LN} vs {RN}",
-                            description=(
-                                "No votes were cast, so winner picked automatically.\n"
-                                f"🏆 **Winner:** {wname}" + (f" (<@{wrow['user_id']}>)" if wrow and wrow["user_id"] else "")
-                            ),
-                            colour=discord.Colour.green()
-                        )
-                        if wrow and (wrow["image_url"] or "").strip():
-                            data = await fetch_image_bytes(wrow["image_url"])
-                            if data:
-                                file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
-                                em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
-                                await ch.send(embed=em, file=file)
-                            else:
-                                await ch.send(embed=em)
-                        else:
-                            await ch.send(embed=em)
-                    except Exception as ex:
-                        print("[stylo_finish] auto tie announce err:", ex)
-                continue
-
-            # real tie with votes -> re-vote
+            # re-open this match for a fresh vote
             any_revote = True
             new_end = now + timedelta(seconds=vote_sec)
-            cur.execute("UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
-                        (new_end.isoformat(), m["id"]))
+            cur.execute(
+                "UPDATE match SET left_votes=0, right_votes=0, end_utc=?, winner_id=NULL WHERE id=?",
+                (new_end.isoformat(), m["id"])
+            )
             cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
             con.commit()
 
+            # 1) edit the ORIGINAL match message (no stacking "Closes")
             if ch and m["msg_id"]:
                 try:
                     msg = await ch.fetch_message(m["msg_id"])
@@ -1096,36 +1063,46 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                         description="Tap a button to vote. One vote per person.",
                         colour=EMBED_COLOUR
                     )
-            
-                    # field 0 = live totals
+
+                    # field 0 = live totals (reset)
                     if em.fields:
-                        em.set_field_at(0, name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
+                        em.set_field_at(0, name="Live totals", value="Total votes: **0**", inline=False)
                     else:
-                        em.add_field(name="Live totals", value="Total votes: **0**\nSplit: **0% / 0%**", inline=False)
-            
-                    # find existing "Closes" field and update it, don’t stack
+                        em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
+
+                    # update or add "Closes"
                     closes_idx = None
                     for idx, f in enumerate(em.fields):
                         if f.name.lower() == "closes":
                             closes_idx = idx
                             break
-            
                     if closes_idx is not None:
                         em.set_field_at(closes_idx, name="Closes", value=rel_ts(new_end), inline=False)
                     else:
                         em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
-            
+
                     view = MatchView(m["id"], new_end, LN, RN)
                     await msg.edit(embed=em, view=view)
+                except Exception as ex:
+                    print("[stylo_finish] tie edit failed:", ex)
+
+            # 2) announce tie-break
+            if ch:
+                try:
+                    await ch.send(embed=discord.Embed(
+                        title=f"🔁 Tie-break — {LN} vs {RN}",
+                        description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
+                        colour=discord.Colour.orange()
+                    ))
                 except:
                     pass
 
-            # optionally re-show both images WITH buttons for the re-vote
+            # 3) re-show BOTH images **with** buttons so users can vote on the fresh post
             if ch:
                 embeds = []
                 files = []
-            
-                # left
+
+                # left image
                 if Lrow and (Lrow["image_url"] or "").strip():
                     Lbytes = await fetch_image_bytes(Lrow["image_url"])
                     if Lbytes:
@@ -1136,8 +1113,8 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                         embeds.append(eL)
                 else:
                     embeds.append(discord.Embed(title=LN, description="No image found.", colour=discord.Colour.dark_grey()))
-            
-                # right
+
+                # right image
                 if Rrow and (Rrow["image_url"] or "").strip():
                     Rbytes = await fetch_image_bytes(Rrow["image_url"])
                     if Rbytes:
@@ -1148,15 +1125,15 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                         embeds.append(eR)
                 else:
                     embeds.append(discord.Embed(title=RN, description="No image found.", colour=discord.Colour.dark_grey()))
-            
+
                 try:
-                    view = MatchView(m["id"], new_end, LN, RN)
+                    view2 = MatchView(m["id"], new_end, LN, RN)
                     if files:
-                        await ch.send(embeds=embeds, files=files, view=view)
+                        await ch.send(embeds=embeds, files=files, view=view2)
                     else:
-                        await ch.send(embeds=embeds, view=view)
-                except:
-                    pass
+                        await ch.send(embeds=embeds, view=view2)
+                except Exception as ex:
+                    print("[stylo_finish] tie images send failed:", ex)
 
             # go to next match
             continue
@@ -1610,7 +1587,7 @@ async def scheduler():
                     cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
                     con.commit()
 
-                    # refresh original message
+                    # 1) refresh original message WITHOUT stacking "Closes"
                     if ch and m["msg_id"]:
                         try:
                             msg = await ch.fetch_message(m["msg_id"])
@@ -1619,20 +1596,35 @@ async def scheduler():
                                 description="Tap a button to vote. One vote per person.",
                                 colour=EMBED_COLOUR
                             )
+
+                            # field 0 = live totals (reset)
                             if em.fields:
                                 em.set_field_at(0, name="Live totals", value="Total votes: **0**", inline=False)
                             else:
                                 em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
-                            em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
+
+                            # update/add "Closes"
+                            closes_idx = None
+                            for idx, f in enumerate(em.fields):
+                                if f.name.lower() == "closes":
+                                    closes_idx = idx
+                                    break
+                            if closes_idx is not None:
+                                em.set_field_at(closes_idx, name="Closes", value=rel_ts(new_end), inline=False)
+                            else:
+                                em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
+
                             view = MatchView(m["id"], new_end, Lname, Rname)
                             await msg.edit(embed=em, view=view)
                         except Exception as e_edit:
                             print("[stylo] tie edit failed:", e_edit)
 
-                    # re-show images for tie so it stays visible
+                    # 2) re-show images WITH buttons for this fresh tie
                     if ch:
                         embeds = []
                         files = []
+
+                        # left
                         if Lurl:
                             Lbytes = await fetch_image_bytes(Lurl)
                             if Lbytes:
@@ -1644,6 +1636,7 @@ async def scheduler():
                         else:
                             embeds.append(discord.Embed(title=Lname, description="No image found.", colour=discord.Colour.dark_grey()))
 
+                        # right
                         if Rurl:
                             Rbytes = await fetch_image_bytes(Rurl)
                             if Rbytes:
@@ -1656,20 +1649,27 @@ async def scheduler():
                             embeds.append(discord.Embed(title=Rname, description="No image found.", colour=discord.Colour.dark_grey()))
 
                         try:
+                            view2 = MatchView(m["id"], new_end, Lname, Rname)
                             if files:
-                                await ch.send(embeds=embeds, files=files)
+                                await ch.send(embeds=embeds, files=files, view=view2)
                             else:
-                                await ch.send(embeds=embeds)
+                                await ch.send(embeds=embeds, view=view2)
                         except:
                             pass
 
-                        await ch.send(embed=discord.Embed(
-                            title=f"🔁 Tie-break — {Lname} vs {Rname}",
-                            description=f"Tied at {L}-{R}. Re-vote open until {rel_ts(new_end)}.",
-                            colour=discord.Colour.orange()
-                        ))
+                        # and the usual notice
+                        try:
+                            await ch.send(embed=discord.Embed(
+                                title=f"🔁 Tie-break — {Lname} vs {Rname}",
+                                description=f"Tied at {L}-{R}. Re-vote open until {rel_ts(new_end)}.",
+                                colour=discord.Colour.orange()
+                            ))
+                        except:
+                            pass
 
-                    continue  # next match
+                    # go to next match
+                    continue
+
 
                 # NORMAL winner
                 winner_id = m["left_id"] if L > R else m["right_id"]
