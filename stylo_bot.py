@@ -740,15 +740,20 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             con.commit()
             con.close()
 
+            theme = ev["theme"] if ev and "theme" in ev.keys() else None
+
             info = discord.Embed(
-                title="📸 Submit your outfit image",
+                title=f"✨ {theme}\n📸 Submit your outfit image" if theme else "📸 Submit your outfit image",
                 description=(
                     "Upload **one** square (1:1) image here.\n"
                     "You can re-upload to replace it—your **latest image** before entries close is used.\n"
-                    "This channel will be deleted when voting starts."
+                    "This channel will be deleted when voting starts.\n"
+                    "If you're lost and confused, just ping any admin, they might not know either,\n"
+                    "but at least you’ll be confused together. 😆"
                 ),
                 colour=EMBED_COLOUR,
             )
+
             await ticket.send(content=inter.user.mention, embed=info)
             await inter.response.send_message("Ticket created — please upload your image there. ✅", ephemeral=True)
 
