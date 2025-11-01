@@ -750,21 +750,23 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 # ---------------- Message listener: capture image ----------------
 @bot.event
 async def on_message(message: discord.Message):
-    # Only handle guild messages, ignore bots
+    # ignore bots / DMs
     if message.author.bot or not message.guild:
         return
 
-    # If no attachments, just let commands run
+    # --- 1) messages with NO attachments ---
     if not message.attachments:
+        # let normal commands run
         await bot.process_commands(message)
-        # 👇 after commands, bump Stylo panel if needed
+        # maybe bump the stylo join panel
         await maybe_bump_stylo_panel(message)
         return
 
+    # --- 2) messages WITH attachments ---
     con = db()
     cur = con.cursor()
     try:
-        # ... your existing ticket-channel image capture ...
+        # is this message in a stylo ticket channel?
         cur.execute(
             "SELECT entrant.id AS entrant_id FROM ticket "
             "JOIN entrant ON entrant.id = ticket.entrant_id "
@@ -773,19 +775,10 @@ async def on_message(message: discord.Message):
         )
         row = cur.fetchone()
         if not row:
+            # not a stylo ticket -> just process commands + maybe bump
             await bot.process_commands(message)
             await maybe_bump_stylo_panel(message)
             return
-
-        # ... existing image detection + re-upload ...
-        # (keep your current code here)
-
-    finally:
-        con.close()
-        await bot.process_commands(message)
-        # 👇 add this
-        await maybe_bump_stylo_panel(message)
-
 
         # ---------- image detection ----------
         def is_image(att: discord.Attachment) -> bool:
@@ -793,24 +786,36 @@ async def on_message(message: discord.Message):
                 return True
             name = (att.filename or "").lower().split("?")[0]
             ext = name.rsplit(".", 1)[-1] if "." in name else ""
-            return ext in {"png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"}
+            return ext in {
+                "png",
+                "jpg",
+                "jpeg",
+                "gif",
+                "webp",
+                "heic",
+                "heif",
+                "bmp",
+                "tif",
+                "tiff",
+            }
 
         img_att = next((a for a in message.attachments if is_image(a)), None)
         if not img_att:
             await bot.process_commands(message)
+            await maybe_bump_stylo_panel(message)
             return
 
         # ---------- read user's upload ----------
         img_bytes = await img_att.read()
 
-        # ---------- re-upload as bot (so deletions don't break URLs) ----------
+        # ---------- re-upload as bot ----------
         bot_file = discord.File(io.BytesIO(img_bytes), filename=img_att.filename or "entry.png")
         bot_msg = await message.channel.send(
             content=(
                 f"📸 Entry updated for <@{message.author.id}>.\n"
                 f"Your most recent image will be used for Stylo."
             ),
-            file=bot_file
+            file=bot_file,
         )
         bot_url = bot_msg.attachments[0].url if bot_msg.attachments else img_att.url
 
@@ -825,8 +830,11 @@ async def on_message(message: discord.Message):
             pass
 
     finally:
+        # always close DB and always let commands through
         con.close()
         await bot.process_commands(message)
+        await maybe_bump_stylo_panel(message)
+
 
 async def maybe_bump_stylo_panel(message: discord.Message):
     # only for guild text channels
