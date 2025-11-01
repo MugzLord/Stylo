@@ -896,7 +896,6 @@ async def maybe_bump_stylo_panel(message: discord.Message):
             join_enabled=True,
         )
 
-
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
 async def stylo_cmd(inter: discord.Interaction):
