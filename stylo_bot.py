@@ -665,7 +665,7 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             ev = cur.fetchone()
             if not ev or ev["state"] != "entry":
                 con.close()
-                await inter.response.send_message("Entries are not open.", ephemeral=True)
+                await inter.response.send_message("Entries are CLOSED.", ephemeral=True)
                 return
 
             entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
@@ -1113,17 +1113,63 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                 except:
                     pass
 
+            
+            # re-show images for tie so it stays visible
             if ch:
+                # 1) NEW: drop a fresh header WITH BUTTONS (so people can vote right here)
                 try:
-                    await ch.send(embed=discord.Embed(
-                        title=f"🔁 Tie-break — {LN} vs {RN}",
-                        description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
+                    tie_header = discord.Embed(
+                        title=f"🔁 Tie-break — {Lname} vs {Rname}",
+                        description=f"Tied at {L}-{R}. Re-vote open until {rel_ts(new_end)}.",
                         colour=discord.Colour.orange()
+                    )
+                    tie_view = MatchView(m["id"], new_end, Lname, Rname)
+                    await ch.send(embed=tie_header, view=tie_view)
+                except Exception as e2:
+                    print("[stylo] tie-break header send failed:", e2)
+            
+                # 2) images (same as before)
+                embeds = []
+                files = []
+            
+                if Lurl:
+                    Lbytes = await fetch_image_bytes(Lurl)
+                    if Lbytes:
+                        fL = discord.File(io.BytesIO(Lbytes), filename="tie_left.png")
+                        files.append(fL)
+                        eL = discord.Embed(title=Lname, colour=discord.Colour.dark_grey())
+                        eL.set_image(url="attachment://tie_left.png")
+                        embeds.append(eL)
+                else:
+                    embeds.append(discord.Embed(
+                        title=Lname,
+                        description="No image found.",
+                        colour=discord.Colour.dark_grey()
                     ))
+            
+                if Rurl:
+                    Rbytes = await fetch_image_bytes(Rurl)
+                    if Rbytes:
+                        fR = discord.File(io.BytesIO(Rbytes), filename="tie_right.png")
+                        files.append(fR)
+                        eR = discord.Embed(title=Rname, colour=discord.Colour.dark_grey())
+                        eR.set_image(url="attachment://tie_right.png")
+                        embeds.append(eR)
+                else:
+                    embeds.append(discord.Embed(
+                        title=Rname,
+                        description="No image found.",
+                        colour=discord.Colour.dark_grey()
+                    ))
+            
+                try:
+                    if files:
+                        await ch.send(embeds=embeds, files=files)
+                    else:
+                        await ch.send(embeds=embeds)
                 except:
                     pass
-            # go to next match
-            continue
+
 
         # ---- normal winner ----
         winner_id = m["left_id"] if L > R else m["right_id"]
