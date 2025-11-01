@@ -746,8 +746,8 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
                 title=f"✨ {theme}\n📸 Submit your outfit image" if theme else "📸 Submit your outfit image",
                 description=(
                     "Upload **one** square (1:1) image here.\n"
-                    "You can re-upload to replace it—your **latest image** before entries close is used.\n"
-                    "This channel will be deleted when voting starts.\n"
+                    "You can re-upload to replace it - your **latest image** before entries close is used.\n"
+                    "This channel will be deleted when voting starts.\n\n"
                     "If you're lost and confused, just ping any admin, they might not know either,\n"
                     "but at least you’ll be confused together. 😆"
                 ),
