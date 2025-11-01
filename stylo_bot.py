@@ -16,6 +16,11 @@ if not TOKEN:
 DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
+# how chatty they can be before we re-post the Stylo panel
+STYLO_CHAT_BUMP_LIMIT = 10
+stylo_chat_counters: dict[int, int] = {}  # key = channel_id -> count
+
+
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.guilds = True
@@ -153,6 +158,29 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
     con.close()
 
 # ---------------- helpers ----------------
+async def send_stylo_status(guild: discord.Guild, ch: discord.TextChannel, ev, entries_open: bool, join_enabled: bool):
+    if not ch:
+        return
+    title = f"✨ Stylo: {ev['theme']}" if ev and ev.get("theme") else "✨ Stylo"
+    desc_lines = []
+    if entries_open:
+        # show when entries close
+        dt = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+        desc_lines.append("Entries are **OPEN** ✨")
+        desc_lines.append(f"Close {rel_ts(dt)}")
+    else:
+        desc_lines.append("Entries are **CLOSED** ✅")
+    em = discord.Embed(
+        title=title,
+        description="\n".join(desc_lines),
+        colour=EMBED_COLOUR
+    )
+    view = build_join_view(join_enabled)
+    try:
+        await ch.send(embed=em, view=view)
+    except Exception as e:
+        print("[stylo] send_stylo_status failed:", e)
+
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
     """Post all matches for a round.
     HARD RULE: for every match with msg_id IS NULL we MUST create a message with buttons.
@@ -729,12 +757,14 @@ async def on_message(message: discord.Message):
     # If no attachments, just let commands run
     if not message.attachments:
         await bot.process_commands(message)
+        # 👇 after commands, bump Stylo panel if needed
+        await maybe_bump_stylo_panel(message)
         return
 
     con = db()
     cur = con.cursor()
     try:
-        # Is this message in a Stylo ticket channel?
+        # ... your existing ticket-channel image capture ...
         cur.execute(
             "SELECT entrant.id AS entrant_id FROM ticket "
             "JOIN entrant ON entrant.id = ticket.entrant_id "
@@ -743,9 +773,19 @@ async def on_message(message: discord.Message):
         )
         row = cur.fetchone()
         if not row:
-            # not a Stylo ticket, process normal commands
             await bot.process_commands(message)
+            await maybe_bump_stylo_panel(message)
             return
+
+        # ... existing image detection + re-upload ...
+        # (keep your current code here)
+
+    finally:
+        con.close()
+        await bot.process_commands(message)
+        # 👇 add this
+        await maybe_bump_stylo_panel(message)
+
 
         # ---------- image detection ----------
         def is_image(att: discord.Attachment) -> bool:
@@ -787,6 +827,44 @@ async def on_message(message: discord.Message):
     finally:
         con.close()
         await bot.process_commands(message)
+
+async def maybe_bump_stylo_panel(message: discord.Message):
+    # only for guild text channels
+    if not message.guild or not isinstance(message.channel, discord.TextChannel):
+        return
+
+    # don't bump for bots (we already filtered earlier but be safe)
+    if message.author.bot:
+        return
+
+    # see if this channel is actually the Stylo main channel
+    con = db()
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT * FROM event WHERE guild_id=? AND state IN ('entry','voting')", (message.guild.id,))
+        ev = cur.fetchone()
+    finally:
+        con.close()
+
+    if not ev:
+        return  # no active stylo
+
+    if ev["main_channel_id"] != message.channel.id:
+        return  # chat is in some other channel, don't bump here
+
+    # ok: this is the active stylo channel
+    cid = message.channel.id
+    current = stylo_chat_counters.get(cid, 0) + 1
+    stylo_chat_counters[cid] = current
+
+    if current >= STYLO_CHAT_BUMP_LIMIT:
+        # reset
+        stylo_chat_counters[cid] = 0
+        # entries are open only if state='entry'
+        entries_open = (ev["state"] == "entry")
+        join_enabled = (ev["state"] == "entry")
+        await send_stylo_status(message.guild, message.channel, ev, entries_open=entries_open, join_enabled=join_enabled)
+
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
