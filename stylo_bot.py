@@ -158,28 +158,42 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
     con.close()
 
 # ---------------- helpers ----------------
-async def send_stylo_status(guild: discord.Guild, ch: discord.TextChannel, ev, entries_open: bool, join_enabled: bool):
+async def send_stylo_status(
+    guild: discord.Guild,
+    ch: discord.TextChannel,
+    ev,
+    entries_open: bool,
+    join_enabled: bool,
+):
+    """Post a fresh Stylo card at the bottom — works with sqlite.Row."""
     if not ch:
         return
-    title = f"✨ Stylo: {ev['theme']}" if ev and ev.get("theme") else "✨ Stylo"
+
+    # ev might be sqlite3.Row or a dict we made on the fly
+    theme = ev["theme"] if ("theme" in ev.keys()) else ev.get("theme", "Stylo")
+    title = f"✨ Stylo: {theme}" if theme else "✨ Stylo"
+
     desc_lines = []
     if entries_open:
-        # show when entries close
-        dt = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+        end_iso = ev["entry_end_utc"]
+        dt = datetime.fromisoformat(end_iso).replace(tzinfo=timezone.utc)
         desc_lines.append("Entries are **OPEN** ✨")
         desc_lines.append(f"Close {rel_ts(dt)}")
     else:
         desc_lines.append("Entries are **CLOSED** ✅")
+
     em = discord.Embed(
         title=title,
         description="\n".join(desc_lines),
-        colour=EMBED_COLOUR
+        colour=EMBED_COLOUR,
     )
     view = build_join_view(join_enabled)
+
     try:
         await ch.send(embed=em, view=view)
     except Exception as e:
         print("[stylo] send_stylo_status failed:", e)
+
 
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
     """Post all matches for a round.
@@ -841,38 +855,41 @@ async def maybe_bump_stylo_panel(message: discord.Message):
     if not message.guild or not isinstance(message.channel, discord.TextChannel):
         return
 
-    # don't bump for bots (we already filtered earlier but be safe)
+    # don't bump for bots
     if message.author.bot:
         return
 
-    # see if this channel is actually the Stylo main channel
     con = db()
     cur = con.cursor()
     try:
-        cur.execute("SELECT * FROM event WHERE guild_id=? AND state IN ('entry','voting')", (message.guild.id,))
+        cur.execute(
+            "SELECT * FROM event WHERE guild_id=? AND state IN ('entry','voting')",
+            (message.guild.id,),
+        )
         ev = cur.fetchone()
     finally:
         con.close()
 
     if not ev:
-        return  # no active stylo
+        return
 
+    # only bump in the actual stylo channel
     if ev["main_channel_id"] != message.channel.id:
-        return  # chat is in some other channel, don't bump here
+        return
 
-    # ok: this is the active stylo channel
     cid = message.channel.id
     current = stylo_chat_counters.get(cid, 0) + 1
     stylo_chat_counters[cid] = current
 
     if current >= STYLO_CHAT_BUMP_LIMIT:
-        # reset
-        stylo_chat_counters[cid] = 0
-        # entries are open only if state='entry'
+        stylo_chat_counters[cid] = 0  # reset
+
         entries_open = (ev["state"] == "entry")
         join_enabled = (ev["state"] == "entry")
-        await send_stylo_status(message.guild, message.channel, ev, entries_open=entries_open, join_enabled=join_enabled)
 
+        guild = message.guild
+        ch = message.channel
+        await send_stylo_status(guild, ch, ev, entries_open, join_enabled)
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
