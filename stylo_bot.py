@@ -885,11 +885,13 @@ async def maybe_bump_stylo_panel(message: discord.Message):
         stylo_chat_counters[cid] = 0  # reset
 
         entries_open = (ev["state"] == "entry")
-        join_enabled = (ev["state"] == "entry")
-
+        if not entries_open:
+            # don't spam "closed" cards
+            return
+        
         guild = message.guild
         ch = message.channel
-        await send_stylo_status(guild, ch, ev, entries_open, join_enabled)
+        await send_stylo_status(guild, ch, ev, entries_open=True, join_enabled=True)
 
 # ---------------- Commands ----------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
