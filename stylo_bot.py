@@ -665,7 +665,7 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
             ev = cur.fetchone()
             if not ev or ev["state"] != "entry":
                 con.close()
-                await inter.response.send_message("Entries are CLOSED.", ephemeral=True)
+                await inter.response.send_message("Entries are Open.", ephemeral=True)
                 return
 
             entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
