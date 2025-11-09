@@ -157,6 +157,57 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
     con.commit()
     con.close()
 
+def create_missing_matches_for_round(ev, existing_matches, now: datetime):
+    """Find entrants (with image) that are NOT in any match for this round, create matches for them.
+    Returns (created: bool, new_end: datetime|None)
+    """
+    con = db()
+    cur = con.cursor()
+    try:
+        used_ids = set()
+        for m in existing_matches:
+            used_ids.add(m["left_id"])
+            used_ids.add(m["right_id"])
+
+        # all entrants that are actually ready (have image)
+        cur.execute(
+            "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
+            (ev["guild_id"],)
+        )
+        all_ready = [r["id"] for r in cur.fetchall()]
+
+        missing = [eid for eid in all_ready if eid not in used_ids]
+        if not missing:
+            return False, None
+
+        random.shuffle(missing)
+        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+        new_end = now + timedelta(seconds=vote_sec)
+
+        for i in range(0, len(missing), 2):
+            left_id = missing[i]
+            if i + 1 < len(missing):
+                right_id = missing[i + 1]
+            else:
+                # odd one out -> pair with self so we can resolve it next finish
+                right_id = left_id
+
+            cur.execute(
+                "INSERT INTO match (guild_id, round_index, left_id, right_id, end_utc) VALUES (?,?,?,?,?)",
+                (ev["guild_id"], ev["round_index"], left_id, right_id, new_end.isoformat())
+            )
+
+        # update event end so round stays open
+        cur.execute(
+            "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+            (new_end.isoformat(), ev["guild_id"])
+        )
+        con.commit()
+        return True, new_end
+    finally:
+        con.close()
+
+
 # ---------------- helpers ----------------
 async def send_stylo_status(
     guild: discord.Guild,
@@ -1017,6 +1068,19 @@ async def stylo_finish_round_now(inter: discord.Interaction):
     cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
                 (ev["guild_id"], ev["round_index"]))
     matches = cur.fetchall()
+        # 👀 check for late entrants that never got matched
+        created, new_end = create_missing_matches_for_round(ev, matches, now)
+        if created:
+            # post the newly created matches and stop here
+            await post_round_matches(ev, ev["round_index"], new_end, con, cur)
+            await inter.followup.send(
+                "There were late entries with valid images — I posted their matches and extended the round. ✅",
+                ephemeral=True
+            )
+            con.close()
+            return
+
+    
     winners = []
     vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
     any_revote = False
@@ -1546,6 +1610,19 @@ async def scheduler():
                 (ev["guild_id"], ev["round_index"])
             )
             matches = cur.fetchall()
+                # 👀 before resolving, see if there are entrants-with-image that never got a match
+                created, new_end = create_missing_matches_for_round(ev, matches, now)
+                if created:
+                    # post them and skip the rest of this tick so people can vote
+                    if ch:
+                        await ch.send(embed=discord.Embed(
+                            title="🆕 Late Stylo match posted",
+                            description=f"Some looks came in late — voting extended to {rel_ts(new_end)}.",
+                            colour=EMBED_COLOUR
+                        ))
+                    await post_round_matches(ev, ev["round_index"], new_end, con, cur)
+                    continue
+
 
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
             any_revote = False
