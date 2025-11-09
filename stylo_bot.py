@@ -1065,21 +1065,22 @@ async def stylo_finish_round_now(inter: discord.Interaction):
     ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
 
     # pretend the round has ended
-    cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
-                (ev["guild_id"], ev["round_index"]))
+    cur.execute(
+        "SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+        (ev["guild_id"], ev["round_index"])
+    )
     matches = cur.fetchall()
-        # 👀 check for late entrants that never got matched
-        created, new_end = create_missing_matches_for_round(ev, matches, now)
-        if created:
-            # post the newly created matches and stop here
-            await post_round_matches(ev, ev["round_index"], new_end, con, cur)
-            await inter.followup.send(
-                "There were late entries with valid images — I posted their matches and extended the round. ✅",
-                ephemeral=True
-            )
-            con.close()
-            return
-
+    
+    # 👇 this must be at the SAME level as `matches = ...`
+    created, new_end = create_missing_matches_for_round(ev, matches, now)
+    if created:
+        await post_round_matches(ev, ev["round_index"], new_end, con, cur)
+        await inter.followup.send(
+            "There were late entries with valid images — I posted their matches and extended the round. ✅",
+            ephemeral=True
+        )
+        con.close()
+        return
     
     winners = []
     vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
