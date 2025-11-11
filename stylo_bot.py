@@ -158,27 +158,37 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
     con.close()
 
 def create_missing_matches_for_round(ev, existing_matches, now: datetime):
-    """Find entrants (with image) that are NOT in any match for this round, create matches for them.
-    Returns (created: bool, new_end: datetime|None)
-    """
-    con = db()
-    cur = con.cursor()
-    try:
-        used_ids = set()
-        for m in existing_matches:
-            used_ids.add(m["left_id"])
-            used_ids.add(m["right_id"])
+    ...
+    missing = [eid for eid in all_ready if eid not in used_ids]
+    if not missing:
+        return False, None
 
-        # all entrants that are actually ready (have image)
+    random.shuffle(missing)
+
+    # 👇 NEW: if there's an odd one, leave them for the end-of-round special logic
+    orphan_id = None
+    if len(missing) % 2 == 1:
+        orphan_id = missing.pop()   # we just don't create a match for this one
+
+    vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+    new_end = now + timedelta(seconds=vote_sec)
+
+    for i in range(0, len(missing), 2):
+        left_id = missing[i]
+        right_id = missing[i + 1]
         cur.execute(
-            "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
-            (ev["guild_id"],)
+            "INSERT INTO match (guild_id, round_index, left_id, right_id, end_utc) VALUES (?,?,?,?,?)",
+            (ev["guild_id"], ev["round_index"], left_id, right_id, new_end.isoformat())
         )
-        all_ready = [r["id"] for r in cur.fetchall()]
 
-        missing = [eid for eid in all_ready if eid not in used_ids]
-        if not missing:
-            return False, None
+    # keep round open
+    cur.execute(
+        "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+        (new_end.isoformat(), ev["guild_id"])
+    )
+    con.commit()
+    return True, new_end
+
 
         random.shuffle(missing)
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
@@ -255,14 +265,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
     if not (guild and ch):
         return
 
-    # get all matches for this round that are not yet posted
-    cur.execute(
-        "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
-        (ev["guild_id"], round_index)
-    )
-    matches = cur.fetchall()
-    losers_this_round = []
-
+  
     for m in matches:
         try:
             # get entrants
@@ -1330,27 +1333,20 @@ async def stylo_finish_round_now(inter: discord.Interaction):
     special_right = None
 
     if leftover_id is not None:
-        need_special = True
-        special_left = leftover_id
-    elif len(all_winners_this_round) % 2 == 1:
-        need_special = True
-        # take last winner as odd one
-        special_left = all_winners_this_round.pop()
-
-    if need_special:
         # pick best loser from THIS round
+        special_right = None
         if losers_this_round:
             losers_this_round.sort(key=lambda x: x[1], reverse=True)
             special_right = losers_this_round[0][0]
-
+    
         if special_right is not None:
+            # make special match in SAME round
             vote_end_2 = now + timedelta(seconds=vote_sec)
             cur.execute(
                 "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                (ev["guild_id"], ev["round_index"], special_left, special_right, vote_end_2.isoformat())
+                (ev["guild_id"], ev["round_index"], leftover_id, special_right, vote_end_2.isoformat())
             )
             con.commit()
-            # extend current round
             cur.execute(
                 "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
                 (vote_end_2.isoformat(), ev["guild_id"])
@@ -1359,16 +1355,16 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             if ch:
                 await ch.send(embed=discord.Embed(
                     title="🆚 Stylo — Special Match",
-                    description="Odd number of looks, so the spare one battles the **strongest loser** from this round.",
+                    description="Odd look in round 1, so it battles the strongest loser from this round.",
                     colour=EMBED_COLOUR
                 ))
                 await post_round_matches(ev, ev["round_index"], vote_end_2, con, cur)
-            con.close()
-            await inter.followup.send("Special match created to fix odd entrants. ✅", ephemeral=True)
-            return
+            # stop here for this tick — wait for this special match
+            continue
         else:
-            # no loser to pair with -> put it back
-            all_winners_this_round.append(special_left)
+            # no loser? just push it through
+            all_winners_this_round.append(leftover_id)
+    
 
     # ===== unlock chat before next round =====
     if ch and guild:
@@ -1898,6 +1894,15 @@ async def scheduler():
                     (winner_id, now.isoformat(), m["id"])
                 )
                 con.commit()
+                
+                # 👇 NEW
+                if winner_id == m["left_id"]:
+                    loser_id = m["right_id"]
+                    loser_votes = R
+                else:
+                    loser_id = m["left_id"]
+                    loser_votes = L
+                losers_this_round.append((loser_id, loser_votes))
 
                 # announce result immediately
                 if ch:
@@ -1954,30 +1959,28 @@ async def scheduler():
             all_winners_this_round = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
 
             # 4) round 1 odd-fix (leftover)
-            leftover_ids = []
+            leftover_id = None
             if ev["round_index"] == 1:
                 # who fought
                 cur.execute(
                     "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
                     (ev["guild_id"], ev["round_index"])
                 )
-                fought = cur.fetchall()
-                fought_ids = set()
-                for r in fought:
-                    fought_ids.add(r["left_id"])
-                    fought_ids.add(r["right_id"])
-
-                # all valid entrants
+                fought_rows = cur.fetchall()
+                fought_ids = {r["left_id"] for r in fought_rows} | {r["right_id"] for r in fought_rows}
+            
+                # all valid entrants in event
                 cur.execute(
                     "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
                     (ev["guild_id"],)
                 )
                 all_event_ids = {r["id"] for r in cur.fetchall()}
+            
+                # leftover = in event, not fought, not already winner
+                leftovers = list(all_event_ids - fought_ids - set(all_winners_this_round))
+                if len(leftovers) == 1:
+                    leftover_id = leftovers[0]
 
-                leftover_ids = list(all_event_ids - fought_ids - set(all_winners_this_round))
-
-                if len(leftover_ids) == 1 and len(all_winners_this_round) >= 1:
-                    leftover_id = leftover_ids[0]
                     # try to create special in SAME round
                     cur.execute(
                         "SELECT 1 FROM match WHERE guild_id=? AND round_index=? AND (left_id=? OR right_id=?) LIMIT 1",
