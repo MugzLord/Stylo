@@ -2153,11 +2153,13 @@ async def scheduler():
             cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
             con.commit()
 
-        con.close()
-    except Exception as e:
-        import traceback, sys
-        print(f"[stylo] ERROR voting-end: {e!r}")
-        traceback.print_exc(file=sys.stderr)
+        # ← we are still inside: for ev in cur.fetchall():
+        # nothing else here for this event, go to next event
+    con.close()
+except Exception as e:
+    import traceback, sys
+    print(f"[stylo] ERROR voting-end: {e!r}")
+    traceback.print_exc(file=sys.stderr)
 
 
 @scheduler.before_loop
