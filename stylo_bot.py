@@ -1525,40 +1525,47 @@ async def lock_tickets_for_guild(guild: discord.Guild):
         
     def create_missing_matches_for_round(ev, existing_matches, now: datetime):
         """
-        Find entrants (with image) that are NOT in any match for this round,
-        create matches for them, and extend the round.
+        Find entrants (with image) that are NOT in any match for this round, create matches for them.
+        We DO NOT self-pair here; if there's 1 odd entrant, we leave it for the end-of-round special logic.
         Returns (created: bool, new_end: datetime|None)
         """
         con = db()
         cur = con.cursor()
         try:
-            # IDs already used in this round
             used_ids = set()
             for m in existing_matches:
                 used_ids.add(m["left_id"])
                 used_ids.add(m["right_id"])
     
-            # entrants that are ready (have image)
+            # all entrants that are ready (have image)
             cur.execute(
                 "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
                 (ev["guild_id"],)
             )
             all_ready = [r["id"] for r in cur.fetchall()]
     
+            # which ones are missing from this round
             missing = [eid for eid in all_ready if eid not in used_ids]
             if not missing:
                 return False, None
     
             random.shuffle(missing)
+    
+            # if there's an odd one, leave it for the end-of-round special logic
+            if len(missing) % 2 == 1:
+                missing.pop()
+    
+            # if we popped the only one, nothing to do
+            if not missing:
+                return False, None
+    
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
             new_end = now + timedelta(seconds=vote_sec)
     
+            # create pairs
             for i in range(0, len(missing), 2):
                 left_id = missing[i]
-                if i + 1 < len(missing):
-                    right_id = missing[i + 1]
-                else:
-                    right_id = left_id  # odd one out
+                right_id = missing[i + 1]
                 cur.execute(
                     "INSERT INTO match (guild_id, round_index, left_id, right_id, end_utc) VALUES (?,?,?,?,?)",
                     (ev["guild_id"], ev["round_index"], left_id, right_id, new_end.isoformat())
@@ -1571,6 +1578,7 @@ async def lock_tickets_for_guild(guild: discord.Guild):
             )
             con.commit()
             return True, new_end
+    
         finally:
             con.close()
 
