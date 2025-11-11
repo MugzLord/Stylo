@@ -261,6 +261,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         (ev["guild_id"], round_index)
     )
     matches = cur.fetchall()
+    losers_this_round = []
 
     for m in matches:
         try:
@@ -1071,39 +1072,7 @@ async def stylo_finish_round_now(inter: discord.Interaction):
     )
     matches = cur.fetchall()
     
-    # 👇 this must be at the SAME level as `matches = ...`
-    created, new_end = create_missing_matches_for_round(ev, matches, now)
-    if created:
-        await post_round_matches(ev, ev["round_index"], new_end, con, cur)
-        await inter.followup.send(
-            "There were late entries with valid images — I posted their matches and extended the round. ✅",
-            ephemeral=True
-        )
-        con.close()
-        return
-    
-    winners = []
-    vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-    any_revote = False
-
-    for m in matches:
-        L = m["left_votes"]
-        R = m["right_votes"]
-
-        # 🚩 NEW: if the match was never posted, post it now instead of tie-breaking
-        if m["msg_id"] is None:
-            try:
-                new_end = now + timedelta(seconds=vote_sec)
-                await post_round_matches(ev, ev["round_index"], new_end, con, cur)
-                cur.execute(
-                    "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
-                    (new_end.isoformat(), ev["guild_id"])
-                )
-                con.commit()
-            except Exception as ex:
-                print(f"[stylo_finish] re-post missing match {m['id']} failed: {ex!r}")
-            continue
-
+   
         cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["left_id"],))
         Lrow = cur.fetchone()
         cur.execute("SELECT name, user_id, image_url FROM entrant WHERE id=?", (m["right_id"],))
@@ -1137,14 +1106,24 @@ async def stylo_finish_round_now(inter: discord.Interaction):
 
         # ---- normal winner ----
         winner_id = m["left_id"] if L > R else m["right_id"]
-        cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
-                    (winner_id, now.isoformat(), m["id"]))
+        cur.execute(
+            "UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+            (winner_id, now.isoformat(), m["id"])
+        )
         con.commit()
+        
+        # 👇 NEW: track this match's loser for possible special match
+        if winner_id == m["left_id"]:
+            loser_id = m["right_id"]
+            loser_votes = R
+        else:
+            loser_id = m["left_id"]
+            loser_votes = L
+        losers_this_round.append((loser_id, loser_votes))
+        
+        # your existing list of winners
         winners.append((m["id"], winner_id, LN, RN, L, R))
 
-        total = max(1, L + R)
-        pL = round((L / total) * 100, 1)
-        pR = round((R / total) * 100, 1)
 
         if ch:
             try:
@@ -1174,7 +1153,8 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             except Exception as ex:
                 print("[stylo_finish] result send err:", ex)
 
-    # ----- if any re-vote, extend round and continue -----
+ 
+    # 2) if any tie -> extend round and stop
     if any_revote:
         cur.execute(
             "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
@@ -1187,39 +1167,98 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                 (mx, ev["guild_id"])
             )
             con.commit()
-        con.close()
-        await inter.followup.send("Round extended due to tie-breaks. ✅", ephemeral=True)
-        return
-
-    # 🔴 NEW: if we got here and we have NO winners at all,
-    # it means there was nothing to advance -> just close it
-    if not winners:
-        if ch and guild:
-            try:
-                await ch.set_permissions(guild.default_role, send_messages=True)
-            except:
-                pass
-        cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
-        con.commit()
-        con.close()
-        if ch:
-            try:
+        continue
+    
+    # 3) collect ALL winners of this round
+    cur.execute(
+        "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
+        (ev["guild_id"], ev["round_index"])
+    )
+    all_winners_this_round = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
+    
+    # 4) find leftover entrants that never fought (only possible on round 1)
+    leftover_id = None
+    if ev["round_index"] == 1:
+        # who fought
+        cur.execute(
+            "SELECT left_id, right_id FROM match WHERE guild_id=? AND round_index=?",
+            (ev["guild_id"], ev["round_index"])
+        )
+        fought = cur.fetchall()
+        fought_ids = set()
+        for r in fought:
+            fought_ids.add(r["left_id"])
+            fought_ids.add(r["right_id"])
+    
+        # all valid entrants for this event
+        cur.execute(
+            "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
+            (ev["guild_id"],)
+        )
+        all_event_ids = {r["id"] for r in cur.fetchall()}
+    
+        # leftovers = in event, not fought, not already winner
+        leftovers = list(all_event_ids - fought_ids - set(all_winners_this_round))
+        if len(leftovers) == 1:
+            leftover_id = leftovers[0]
+    
+    # 5) do we need a special match?
+    need_special = False
+    special_left = None
+    special_right = None
+    
+    if leftover_id is not None:
+        # case A: we had an odd entrant in this round → pair them with best loser
+        need_special = True
+        special_left = leftover_id
+    elif len(all_winners_this_round) % 2 == 1:
+        # case B: winners are odd → take last winner as odd one
+        need_special = True
+        special_left = all_winners_this_round.pop()  # temporarily remove, will re-add after special
+        # ^ this keeps all_winners_this_round even
+    
+    if need_special:
+        # pick best loser from THIS round
+        special_right = None
+        if losers_this_round:
+            # sort by vote desc, pick first
+            losers_this_round.sort(key=lambda x: x[1], reverse=True)
+            special_right = losers_this_round[0][0]
+    
+        if special_right is not None:
+            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+            vote_end_2 = now + timedelta(seconds=vote_sec)
+            cur.execute(
+                "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                (ev["guild_id"], ev["round_index"], special_left, special_right, vote_end_2.isoformat())
+            )
+            con.commit()
+            # extend current round to let people vote
+            cur.execute(
+                "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                (vote_end_2.isoformat(), ev["guild_id"])
+            )
+            con.commit()
+            if ch:
                 await ch.send(embed=discord.Embed(
-                    title="⛔ Stylo ended",
-                    description="No valid matches to advance, so this round was closed.",
-                    colour=discord.Colour.red()
+                    title="🆚 Stylo — Special Match",
+                    description="Odd number of looks, so the spare one battles the **strongest loser** from this round.",
+                    colour=EMBED_COLOUR
                 ))
-            except:
-                pass
-        await inter.followup.send("Round closed — no winners to advance. ✅", ephemeral=True)
-        return
-
-    # ----- unlock main chat because we're moving on -----
+                await post_round_matches(ev, ev["round_index"], vote_end_2, con, cur)
+            # wait for this special match to finish
+            continue
+        else:
+            # no loser to pair with, shove it back to winners so we don't lose it
+            all_winners_this_round.append(special_left)
+    
+    # 6) unlock chat before next round
     if ch and guild:
         try:
             await ch.set_permissions(guild.default_role, send_messages=True)
         except:
             pass
+
 
     # CHAMPION?
     if len(winners) == 1:
@@ -1608,6 +1647,7 @@ async def scheduler():
 
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
             any_revote = False
+            losers_this_round = []
 
             # 1) resolve every match
             for m in matches:
