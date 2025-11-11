@@ -1103,16 +1103,13 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             ...
             continue
 
-
         # ---- normal winner ----
         winner_id = m["left_id"] if L > R else m["right_id"]
-        cur.execute(
-            "UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
-            (winner_id, now.isoformat(), m["id"])
-        )
+        cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+                    (winner_id, now.isoformat(), m["id"]))
         con.commit()
         
-        # 👇 NEW: track this match's loser for possible special match
+        # 👇 NEW: record the loser from THIS match
         if winner_id == m["left_id"]:
             loser_id = m["right_id"]
             loser_votes = R
@@ -1121,7 +1118,6 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             loser_votes = L
         losers_this_round.append((loser_id, loser_votes))
         
-        # your existing list of winners
         winners.append((m["id"], winner_id, LN, RN, L, R))
 
 
@@ -1644,7 +1640,7 @@ async def scheduler():
                 continue
 
 
-
+            winners = []
             vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
             any_revote = False
             losers_this_round = []
