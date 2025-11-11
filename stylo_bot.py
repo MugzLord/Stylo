@@ -1743,19 +1743,19 @@ async def scheduler():
                 (ev["guild_id"], ev["round_index"])
             )
             matches = cur.fetchall()
-    
-            # before resolving, see if there are entrants-with-image that never got a match
-            created, new_end = create_missing_matches_for_round(ev, matches, now)
-            if created:
-                # post them and skip the rest of this tick so people can vote
-                if ch:
-                    await ch.send(embed=discord.Embed(
-                        title="🆕 Late Stylo match posted",
-                        description=f"Some looks came in late — voting extended to {rel_ts(new_end)}.",
-                        colour=EMBED_COLOUR
-                    ))
-                await post_round_matches(ev, ev["round_index"], new_end, con, cur)
-                continue
+            
+            # ✅ only do late-match creation on round 1
+            if ev["round_index"] == 1:
+                created, new_end = create_missing_matches_for_round(ev, matches, now)
+                if created:
+                    if ch:
+                        await ch.send(embed=discord.Embed(
+                            title="🆕 Late Stylo match posted",
+                            description=f"Some looks came in late — voting extended to {rel_ts(new_end)}.",
+                            colour=EMBED_COLOUR
+                        ))
+                    await post_round_matches(ev, ev["round_index"], new_end, con, cur)
+                    continue
 
 
             winners = []
