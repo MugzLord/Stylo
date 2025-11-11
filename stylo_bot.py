@@ -1111,9 +1111,18 @@ async def stylo_finish_round_now(inter: discord.Interaction):
         LN = (Lrow["name"] if Lrow else "Left")
         RN = (Rrow["name"] if Rrow else "Right")
 
-        # ---- tie handling (same as we wanted) ----
+        # ---- first: if it was a self-pair, just award it ----
+        if m["left_id"] == m["right_id"]:
+            cur.execute(
+                "UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
+                (m["left_id"], now.isoformat(), m["id"])
+            )
+            con.commit()
+            # you can announce if you want, or just move on
+            continue
+
+        # ---- true tie between two different entrants ----
         if L == R:
-            # re-open this match for a fresh vote
             any_revote = True
             new_end = now + timedelta(seconds=vote_sec)
             cur.execute(
@@ -1122,90 +1131,9 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             )
             cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
             con.commit()
-
-            # 1) edit the ORIGINAL match message (no stacking "Closes")
-            if ch and m["msg_id"]:
-                try:
-                    msg = await ch.fetch_message(m["msg_id"])
-                    em = msg.embeds[0] if msg.embeds else discord.Embed(
-                        title=f"Round {ev['round_index']} — {LN} vs {RN}",
-                        description="Tap a button to vote. One vote per person.",
-                        colour=EMBED_COLOUR
-                    )
-
-                    # field 0 = live totals (reset)
-                    if em.fields:
-                        em.set_field_at(0, name="Live totals", value="Total votes: **0**", inline=False)
-                    else:
-                        em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
-
-                    # update or add "Closes"
-                    closes_idx = None
-                    for idx, f in enumerate(em.fields):
-                        if f.name.lower() == "closes":
-                            closes_idx = idx
-                            break
-                    if closes_idx is not None:
-                        em.set_field_at(closes_idx, name="Closes", value=rel_ts(new_end), inline=False)
-                    else:
-                        em.add_field(name="Closes", value=rel_ts(new_end), inline=False)
-
-                    view = MatchView(m["id"], new_end, LN, RN)
-                    await msg.edit(embed=em, view=view)
-                except Exception as ex:
-                    print("[stylo_finish] tie edit failed:", ex)
-
-            # 2) announce tie-break
-            if ch:
-                try:
-                    await ch.send(embed=discord.Embed(
-                        title=f"🔁 Tie-break — {LN} vs {RN}",
-                        description=f"Tied at {L}-{R}. Re-vote is open now and closes {rel_ts(new_end)}.",
-                        colour=discord.Colour.orange()
-                    ))
-                except:
-                    pass
-
-            # 3) re-show BOTH images **with** buttons so users can vote on the fresh post
-            if ch:
-                embeds = []
-                files = []
-
-                # left image
-                if Lrow and (Lrow["image_url"] or "").strip():
-                    Lbytes = await fetch_image_bytes(Lrow["image_url"])
-                    if Lbytes:
-                        fL = discord.File(io.BytesIO(Lbytes), filename="tie_left.png")
-                        files.append(fL)
-                        eL = discord.Embed(title=LN, colour=discord.Colour.dark_grey())
-                        eL.set_image(url="attachment://tie_left.png")
-                        embeds.append(eL)
-                else:
-                    embeds.append(discord.Embed(title=LN, description="No image found.", colour=discord.Colour.dark_grey()))
-
-                # right image
-                if Rrow and (Rrow["image_url"] or "").strip():
-                    Rbytes = await fetch_image_bytes(Rrow["image_url"])
-                    if Rbytes:
-                        fR = discord.File(io.BytesIO(Rbytes), filename="tie_right.png")
-                        files.append(fR)
-                        eR = discord.Embed(title=RN, colour=discord.Colour.dark_grey())
-                        eR.set_image(url="attachment://tie_right.png")
-                        embeds.append(eR)
-                else:
-                    embeds.append(discord.Embed(title=RN, description="No image found.", colour=discord.Colour.dark_grey()))
-
-                try:
-                    view2 = MatchView(m["id"], new_end, LN, RN)
-                    if files:
-                        await ch.send(embeds=embeds, files=files, view=view2)
-                    else:
-                        await ch.send(embeds=embeds, view=view2)
-                except Exception as ex:
-                    print("[stylo_finish] tie images send failed:", ex)
-
-            # go to next match
+            ...
             continue
+
 
         # ---- normal winner ----
         winner_id = m["left_id"] if L > R else m["right_id"]
@@ -1685,6 +1613,9 @@ async def scheduler():
             for m in matches:
                 L = m["left_votes"]
                 R = m["right_votes"]
+
+                left_id = m["left_id"]
+                right_id = m["right_id"]
 
                 # message never posted -> post now and extend
                 if m["msg_id"] is None:
