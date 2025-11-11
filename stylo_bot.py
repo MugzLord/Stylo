@@ -1471,10 +1471,10 @@ async def stylo_finish_round_now(inter: discord.Interaction):
             print("[stylo] Failed to lock main chat:", e)
 
         await post_round_matches(ev, new_round, vote_end, con, cur)
-    
-        con.close()
-        await inter.followup.send("Round finished, next round posted. ✅", ephemeral=True)
-    )
+
+    con.close()
+    await inter.followup.send("Round finished, next round posted. ✅", ephemeral=True)
+
 
 @bot.tree.command(name="stylo_set_round_time_left", description="Shorten or extend the CURRENT Stylo voting round (admin).")
 async def stylo_set_round_time_left(inter: discord.Interaction, minutes: int):
