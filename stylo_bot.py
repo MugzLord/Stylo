@@ -2138,6 +2138,7 @@ async def scheduler():
 
                     await post_round_matches(ev, new_round, vote_end, con, cur)
 
+                # we handled this event, go to the next event in the for-loop
                 continue
 
             # 8) nothing to advance -> close
@@ -2153,14 +2154,12 @@ async def scheduler():
             cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
             con.commit()
 
-        # ← we are still inside: for ev in cur.fetchall():
-        # nothing else here for this event, go to next event
-    con.close()
-except Exception as e:
-    import traceback, sys
-    print(f"[stylo] ERROR voting-end: {e!r}")
-    traceback.print_exc(file=sys.stderr)
-
+        # ===== end of: for ev in cur.fetchall() =====
+        con.close()
+    except Exception as e:
+        import traceback, sys
+        print(f"[stylo] ERROR voting-end: {e!r}")
+        traceback.print_exc(file=sys.stderr)
 
 @scheduler.before_loop
 async def _wait_ready():
