@@ -1728,6 +1728,7 @@ async def scheduler():
         print(f"[stylo] ERROR entry->voting: {e!r}")
         traceback.print_exc(file=sys.stderr)
 
+   
     # ========== 2) VOTING END -> RESULTS / NEXT ROUND / CHAMPION ==========
     try:
         con = db()
@@ -1737,33 +1738,45 @@ async def scheduler():
             round_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
             if now < round_end:
                 continue  # round still open
-
+    
             guild = bot.get_guild(ev["guild_id"])
             ch = (
                 guild.get_channel(ev["main_channel_id"])
                 if (guild and ev["main_channel_id"])
                 else (guild.system_channel if guild else None)
             )
-
-            # matches in this round that don't have a winner yet
+    
+            # 👇 get matches in this round
+            cur.execute(
+                "SELECT * FROM match WHERE guild_id=? AND round_index=?",
+                (ev["guild_id"], ev["round_index"])
+            )
+            all_matches_this_round = cur.fetchall()
+    
+            # 🔴 NEW: if there were ZERO matches in this round, just close quietly
+            if not all_matches_this_round:
+                cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+                con.commit()
+                if ch:
+                    try:
+                        await ch.send(embed=discord.Embed(
+                            title="⛔ Stylo ended",
+                            description="Not enough looks to run a real match.",
+                            colour=discord.Colour.red()
+                        ))
+                    except:
+                        pass
+                continue
+    
+            # from here on, keep your existing logic, but use all_matches_this_round
             cur.execute(
                 "SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
                 (ev["guild_id"], ev["round_index"])
             )
             matches = cur.fetchall()
-            
-            # ✅ only do late-match creation on round 1
-            if ev["round_index"] == 1:
-                created, new_end = create_missing_matches_for_round(ev, matches, now)
-                if created:
-                    if ch:
-                        await ch.send(embed=discord.Embed(
-                            title="🆕 Late Stylo match posted",
-                            description=f"Some looks came in late — voting extended to {rel_ts(new_end)}.",
-                            colour=EMBED_COLOUR
-                        ))
-                    await post_round_matches(ev, ev["round_index"], new_end, con, cur)
-                    continue
+            ...
+            # (rest of your resolve/tie/special/next-round code)
+    except Exception as e:
 
 
             winners = []
