@@ -16,6 +16,10 @@ if not TOKEN:
 DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
+DENY_ROLE_IDS = [ ]
+ALLOW_ROLE_IDS = [ ]
+MAIN_CHAT_CHANNEL_ID = int(os.getenv("STYLO_MAIN_CHAT_ID", "0"))
+OWNER_ID = int(os.getenv("STYLO_OWNER_ID", "0"))
 STYLO_CHAT_BUMP_LIMIT = 10
 stylo_chat_counters: dict[int, int] = {}
 
@@ -23,6 +27,10 @@ INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.guilds = True
 INTENTS.members = True
+
+# --- Single Round Chat config ---
+ROUND_CHAT_THREAD_NAME = "stylo-round-chat"
+
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
@@ -162,6 +170,66 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
         )
     con.commit()
     con.close()
+
+async def lock_main_chat(guild: discord.Guild):
+    ch = guild.get_channel(MAIN_CHAT_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    overwrites = ch.overwrites or {}
+
+    # 1) Deny @everyone from sending/reactions
+    overwrites[guild.default_role] = discord.PermissionOverwrite(
+        send_messages=False,
+        add_reactions=False
+    )
+
+    # 2) Explicitly deny listed roles (if they don't have Administrator)
+    for rid in DENY_ROLE_IDS:
+        role = guild.get_role(rid)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=False,
+                add_reactions=False
+            )
+
+    # 3) Allow ONLY the owner (you)
+    owner = guild.get_member(OWNER_ID)
+    if owner:
+        overwrites[owner] = discord.PermissionOverwrite(
+            send_messages=True,
+            add_reactions=True
+        )
+
+    # 4) (Optional) allow a couple of roles
+    for rid in ALLOW_ROLE_IDS:
+        role = guild.get_role(rid)
+        if role:
+            # Allow these roles to speak
+            overwrites[role] = discord.PermissionOverwrite(
+                send_messages=True,
+                add_reactions=True
+            )
+
+    await ch.edit(overwrites=overwrites)
+    
+async def unlock_main_chat(guild: discord.Guild):
+    ch = guild.get_channel(MAIN_CHAT_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    overwrites = ch.overwrites or {}
+
+    # Remove the specific user/role overrides we added
+    to_clear = [guild.default_role, guild.get_member(OWNER_ID)]
+    to_clear += [guild.get_role(rid) for rid in ALLOW_ROLE_IDS]
+    to_clear += [guild.get_role(rid) for rid in DENY_ROLE_IDS]
+    for target in to_clear:
+        if target in overwrites:
+            overwrites.pop(target, None)
+
+    await ch.edit(overwrites=overwrites)
+
 async def cleanup_bump_panels(guild: discord.Guild, ch: discord.TextChannel | None):
     """Delete any temporary voting-bump panels for this guild (if they still exist)."""
     if not guild:
@@ -186,6 +254,29 @@ async def cleanup_bump_panels(guild: discord.Guild, ch: discord.TextChannel | No
         con.commit()
     finally:
         con.close()
+
+async def ensure_round_chat_thread(guild: discord.Guild, fallback_channel: discord.TextChannel) -> discord.Thread:
+    host_ch = guild.get_channel(ROUND_CHAT_CHANNEL_ID) if ROUND_CHAT_CHANNEL_ID else fallback_channel
+    if not isinstance(host_ch, discord.TextChannel):
+        host_ch = fallback_channel
+
+    # Find existing open thread
+    try:
+        async for th in host_ch.active_threads():
+            if th.name == ROUND_CHAT_THREAD_NAME and not th.locked:
+                return th
+    except Exception:
+        pass
+
+    # Create new thread
+    seed_msg = await host_ch.send("🧵 Round chat is here. Keep voting posts clean.")
+    th = await host_ch.create_thread(
+        name=ROUND_CHAT_THREAD_NAME,
+        message=seed_msg,
+        auto_archive_duration=1440  # 24h
+    )
+    await th.send("Chat about this round here. Votes via buttons on pair posts. 👍")
+    return th
 
 
 async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
@@ -333,6 +424,15 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
 
 
 # ---------------- Voting UI ----------------
+class ChatJumpView(discord.ui.View):
+    def __init__(self, chat_url: str, *, timeout: float | None = None):
+        super().__init__(timeout=timeout)
+        self.add_item(discord.ui.Button(
+            label="Round Chat",
+            style=discord.ButtonStyle.link,
+            url=chat_url
+        ))
+
 class MatchView(discord.ui.View):
     def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str):
         timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
