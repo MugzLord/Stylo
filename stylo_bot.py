@@ -853,7 +853,6 @@ async def stylo_finish_round_now(inter: discord.Interaction):
     await inter.followup.send("Round finished.", ephemeral=True)
 
 # ------------- Scheduler -------------
-# ------------- Scheduler -------------
 @tasks.loop(seconds=10)
 async def scheduler():
     now = datetime.now(timezone.utc)
@@ -907,15 +906,19 @@ async def scheduler():
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
         vote_end = now + timedelta(seconds=vote_sec)
 
+        # --- PRE-FLAG EVENT TO PREVENT DOUBLE EXEC ---
+        cur.execute("UPDATE event SET state='pre_voting' WHERE guild_id=?", (ev["guild_id"],))
+        con.commit()
+
         # create Round 1 matches
         for L, R in pairs:
             cur.execute(
-                "INSERT INTO match(guild_id,round_index,left_id,right_id,end_utc) VALUES(?,?,?,?,?)",
+                "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
                 (ev["guild_id"], 1, L["id"], R["id"], vote_end.isoformat())
             )
         con.commit()
 
-        # flip state -> voting
+        # now officially flip to voting
         cur.execute(
             "UPDATE event SET state='voting', round_index=?, entry_end_utc=? WHERE guild_id=?",
             (1, vote_end.isoformat(), ev["guild_id"])
@@ -924,13 +927,11 @@ async def scheduler():
 
         # ---- DISABLE JOIN BUTTONS NOW ----
         if ch:
-            # 1) Disable on the original pinned start message
             if ev["start_msg_id"]:
                 try:
                     start_msg = await ch.fetch_message(ev["start_msg_id"])
                     if start_msg and start_msg.embeds:
                         em = start_msg.embeds[0]
-                        # change "Entries" field to Closed (or add it if missing)
                         idx_entries = None
                         for idx, f in enumerate(em.fields):
                             if f.name.lower().startswith("entries"):
@@ -940,14 +941,11 @@ async def scheduler():
                             em.set_field_at(idx_entries, name="Entries", value="**Closed**", inline=True)
                         else:
                             em.add_field(name="Entries", value="**Closed**", inline=True)
-
-                        # disable the Join button on that message
                         view = build_join_view(False)
                         await start_msg.edit(embed=em, view=view)
                 except Exception as ex:
                     print("[stylo] failed to disable Join on start msg:", ex)
 
-            # 2) Sweep recent messages to disable any other Join panels
             try:
                 async for msg in ch.history(limit=120):
                     if not msg.components:
@@ -957,7 +955,6 @@ async def scheduler():
                     for row in msg.components:
                         for comp in row.children:
                             if isinstance(comp, discord.ui.Button) and comp.custom_id == "stylo:join":
-                                # same label/style, but disabled
                                 b = discord.ui.Button(
                                     style=comp.style,
                                     label=comp.label,
@@ -975,7 +972,6 @@ async def scheduler():
                 print("[stylo] sweep disable Join failed:", ex)
         # ---- /DISABLE JOIN BUTTONS ----
 
-        # announce and drop match posts
         if ch and guild:
             await ch.send(embed=discord.Embed(
                 title="🆚 Stylo — Round 1 begins!",
@@ -997,54 +993,45 @@ async def scheduler():
     for ev in cur.fetchall():
         gid = ev["guild_id"]
         ridx = ev["round_index"]
-    
-        # round ends when the last open match ends
+
         cur.execute(
             "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
             (gid, ridx)
         )
         mx = cur.fetchone()["mx"]
-    
+
         if not mx:
-            # no open matches (shouldn't happen, but be safe) -> advance
             guild = bot.get_guild(gid)
             ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
             await cleanup_bump_panels(guild, ch)
             await advance_to_next_round(ev, datetime.now(timezone.utc), con, cur, guild, ch)
             continue
-    
-        # robust UTC parse
+
         round_end = datetime.fromisoformat(mx).replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
         if now < round_end:
-            continue  # not yet finished
-    
+            continue
+
         guild = bot.get_guild(gid)
         ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
-    
-        # fetch all undecided matches for this round
+
         cur.execute(
             "SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
             (gid, ridx)
         )
         ms = cur.fetchall()
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
-    
+
         any_revote = False
         for m in ms:
             L, R = m["left_votes"], m["right_votes"]
-    
-            # names + (optional) images
-            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
-            Lrow = cur.fetchone()
-            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
-            Rrow = cur.fetchone()
+
+            cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["left_id"],)); Lrow = cur.fetchone()
+            cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["right_id"],)); Rrow = cur.fetchone()
             Lname = Lrow["name"] if Lrow else "Left"
             Rname = Rrow["name"] if Rrow else "Right"
-            Lurl  = (Lrow["image_url"] or "").strip() if Lrow else ""
-            Rurl  = (Rrow["image_url"] or "").strip() if Rrow else ""
-    
-            # TIE -> schedule re-vote with fresh end and reset counts
+            Lurl = (Lrow["image_url"] or "").strip() if Lrow else ""
+            Rurl = (Rrow["image_url"] or "").strip() if Rrow else ""
+
             if L == R:
                 any_revote = True
                 new_end = now + timedelta(seconds=vote_sec)
@@ -1054,10 +1041,9 @@ async def scheduler():
                 )
                 cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
                 con.commit()
-    
+
                 if ch:
                     try:
-                        # Try VS card if both images present
                         file = None
                         if Lurl and Rurl:
                             card = await build_vs_card(Lurl, Rurl)
@@ -1071,18 +1057,17 @@ async def scheduler():
                     except Exception as e:
                         print("[stylo] tie announce failed:", e)
                 continue
-    
-            # NORMAL WINNER
+
             winner_id = m["left_id"] if L > R else m["right_id"]
             cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?", (winner_id, now.isoformat(), m["id"]))
             con.commit()
-    
+
             if ch:
                 try:
                     total = max(1, L + R)
                     pL = round((L / total) * 100, 1)
                     pR = round((R / total) * 100, 1)
-                    cur.execute("SELECT user_id, image_url FROM entrant WHERE id=?", (winner_id,))
+                    cur.execute("SELECT user_id,image_url FROM entrant WHERE id=?", (winner_id,))
                     wrow = cur.fetchone()
                     winner_mention = f"<@{wrow['user_id']}>" if wrow and wrow["user_id"] else "the winner"
                     em = discord.Embed(
@@ -1102,9 +1087,8 @@ async def scheduler():
                     await ch.send(embed=em, file=file) if file else await ch.send(embed=em)
                 except Exception as e:
                     print("[stylo] result send error:", e)
-    
+
         if any_revote:
-            # extend event to the latest re-vote end and stop
             cur.execute(
                 "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
                 (gid, ridx)
@@ -1114,11 +1098,10 @@ async def scheduler():
                 cur.execute("UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?", (mx2, gid))
                 con.commit()
             continue
-    
-        # no ties -> advance to next round / champion
+
         await cleanup_bump_panels(guild, ch)
         await advance_to_next_round(ev, now, con, cur, guild, ch)
-    
+
     con.close()
 
 # ------------- Setup & Run -------------
