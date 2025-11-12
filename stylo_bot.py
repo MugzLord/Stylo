@@ -1118,32 +1118,83 @@ async def cleanup_tickets_for_guild(guild: discord.Guild, reason: str):
 
 # ---------------- Common: advance logic (no late entrants) ----------------
 async def advance_to_next_round(ev, now, con, cur, guild, ch):
-    """Shared between scheduler and /stylo_finish_round_now."""
+    """Shared between scheduler and /stylo_finish_round_now.
+       Fixed: robust leftover vs strongest-loser (Round 1) and for any odd winners in later rounds.
+    """
+    gid = ev["guild_id"]
+    cur_round = ev["round_index"]
+    vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+
     # collect winners for this round
     cur.execute(
         "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
-        (ev["guild_id"], ev["round_index"])
+        (gid, cur_round)
     )
     all_winners_this_round = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
 
-    # odd-fix only for round 1: leftover vs strongest loser
+    # ---- helper: pick opponent with safe fallbacks ----
+    def _pick_leftover_opponent(cur, gid: int, cur_round: int, losers_with_votes: list[tuple[int,int]]):
+        """
+        Return an opponent entrant_id for the leftover, or None to award a bye.
+        Priority:
+          1) highest losing-vote count
+          2) highest total match votes among losers
+          3) deterministic fallback: lowest entrant id among losers
+          4) None -> bye
+        """
+        # 1) strongest by losing votes
+        if losers_with_votes:
+            losers_with_votes.sort(key=lambda t: (t[1], -t[0]), reverse=True)
+            return losers_with_votes[0][0]
+
+        # Build losers/totals from decided matches in this round
+        cur.execute(
+            "SELECT left_id, right_id, left_votes, right_votes, winner_id "
+            "FROM match WHERE guild_id=? AND round_index=?",
+            (gid, cur_round)
+        )
+        rows = cur.fetchall()
+        losers_totals = []   # (loser_id, total_votes)
+        losers_all = set()
+
+        for m in rows:
+            L, R = m["left_votes"], m["right_votes"]
+            if not m["winner_id"]:
+                continue
+            if m["winner_id"] == m["left_id"]:
+                losers_all.add(m["right_id"])
+                losers_totals.append((m["right_id"], L + R))
+            else:
+                losers_all.add(m["left_id"])
+                losers_totals.append((m["left_id"], L + R))
+
+        # 2) highest total votes among losers
+        if losers_totals:
+            losers_totals.sort(key=lambda t: (t[1], -t[0]), reverse=True)
+            return losers_totals[0][0]
+
+        # 3) deterministic fallback: lowest entrant id among losers
+        if losers_all:
+            return min(losers_all)
+
+        # 4) no losers available -> bye
+        return None
+
+    # odd-fix only for round 1: leftover vs strongest loser (hardened + mirrored pool)
     leftover_ids = []
-    if ev["round_index"] == 1:
+    if cur_round == 1:
         cur.execute(
             "SELECT left_id, right_id, left_votes, right_votes, winner_id FROM match WHERE guild_id=? AND round_index=?",
-            (ev["guild_id"], ev["round_index"])
+            (gid, cur_round)
         )
         match_rows = cur.fetchall()
 
         fought_ids = set()
-        strongest_loser_id = None
-        strongest_loser_votes = -1
+        losers_with_votes = []  # (loser_id, losing_vote_count)
 
         for m in match_rows:
             fought_ids.add(m["left_id"])
             fought_ids.add(m["right_id"])
-
-            # find loser
             if m["winner_id"]:
                 if m["winner_id"] == m["left_id"]:
                     loser_id = m["right_id"]
@@ -1151,46 +1202,55 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
                 else:
                     loser_id = m["left_id"]
                     loser_votes = m["left_votes"]
-                if loser_votes > strongest_loser_votes:
-                    strongest_loser_votes = loser_votes
-                    strongest_loser_id = loser_id
+                losers_with_votes.append((loser_id, loser_votes))
 
-        # all entrants with image
+        # mirror scheduler pool selection
+        cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (gid,))
+        total_entrants = cur.fetchone()["c"] or 0
+
         cur.execute(
             "SELECT id FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url) <> ''",
-            (ev["guild_id"],)
+            (gid,)
         )
-        all_ids = {r["id"] for r in cur.fetchall()}
+        with_image = {r["id"] for r in cur.fetchall()}
 
-        # leftover = present in event but did not fight and not already a winner
-        leftover_ids = list(all_ids - fought_ids - set(all_winners_this_round))
+        if len(with_image) >= 2:
+            pool = with_image
+        elif total_entrants >= 2:
+            cur.execute("SELECT id FROM entrant WHERE guild_id=?", (gid,))
+            pool = {r["id"] for r in cur.fetchall()}
+        else:
+            pool = with_image  # edge case: 0/1 entrant
 
-        # if exactly 1 leftover and we have a strongest loser, create special match
-        if len(leftover_ids) == 1 and strongest_loser_id is not None:
-            vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+        leftover_ids = list(pool - set(fought_ids) - set(all_winners_this_round))
+
+        opponent_id = _pick_leftover_opponent(cur, gid, cur_round, losers_with_votes)
+
+        # if exactly 1 leftover and we have an opponent, create special match
+        if len(leftover_ids) == 1 and opponent_id is not None:
             vote_end_2 = now + timedelta(seconds=vote_sec)
             cur.execute(
                 "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                (ev["guild_id"], ev["round_index"], leftover_ids[0], strongest_loser_id, vote_end_2.isoformat())
+                (gid, cur_round, leftover_ids[0], opponent_id, vote_end_2.isoformat())
             )
             con.commit()
             # extend event to let this special match finish
             cur.execute(
                 "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
-                (vote_end_2.isoformat(), ev["guild_id"])
+                (vote_end_2.isoformat(), gid)
             )
             con.commit()
             if ch:
                 await ch.send(embed=discord.Embed(
                     title="🆚 Stylo — Special Match",
-                    description="Odd number of looks, so the spare look battles the **strongest non-winner**.",
+                    description="Odd number of looks, so the spare look battles a wildcard opponent.",
                     colour=EMBED_COLOUR
                 ))
-            await post_round_matches(ev, ev["round_index"], vote_end_2, con, cur)
+            await post_round_matches(ev, cur_round, vote_end_2, con, cur)
             # stop here — scheduler will finish it later
             return
-        elif len(leftover_ids) == 1 and strongest_loser_id is None:
-            # if no strongest loser, just push leftover forward
+        elif len(leftover_ids) == 1 and opponent_id is None:
+            # no opponent -> push leftover forward as a bye
             all_winners_this_round.append(leftover_ids[0])
             leftover_ids = []
 
@@ -1204,7 +1264,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     # champion?
     if len(all_winners_this_round) == 1 and not leftover_ids:
         champ_id = all_winners_this_round[0]
-        cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+        cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (gid,))
         con.commit()
 
         cur.execute("SELECT name, image_url, user_id FROM entrant WHERE id=?", (champ_id,))
@@ -1237,24 +1297,79 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
 
         return
 
+    # ---- NEW: Any round with odd winners -> run special in CURRENT round ----
+    if len(all_winners_this_round) >= 1 and (len(all_winners_this_round) % 2 == 1):
+        # Build losers_with_votes from current round (if not already done in r1)
+        cur.execute(
+            "SELECT left_id, right_id, left_votes, right_votes, winner_id FROM match WHERE guild_id=? AND round_index=?",
+            (gid, cur_round)
+        )
+        rows = cur.fetchall()
+        losers_with_votes_any = []
+        fought_ids_any = set()
+        for m in rows:
+            fought_ids_any.add(m["left_id"]); fought_ids_any.add(m["right_id"])
+            if m["winner_id"]:
+                if m["winner_id"] == m["left_id"]:
+                    losers_with_votes_any.append((m["right_id"], m["right_votes"]))
+                else:
+                    losers_with_votes_any.append((m["left_id"], m["left_votes"]))
+
+        opponent_id_any = _pick_leftover_opponent(cur, gid, cur_round, losers_with_votes_any)
+
+        # Choose a deterministic leftover winner: lowest id among winners
+        leftover_winner = sorted(all_winners_this_round)[-1]  # pick highest id for a bit of variety
+        all_winners_this_round = [w for w in all_winners_this_round if w != leftover_winner]
+
+        if opponent_id_any is not None:
+            vote_end_2 = now + timedelta(seconds=vote_sec)
+            cur.execute(
+                "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
+                (gid, cur_round, leftover_winner, opponent_id_any, vote_end_2.isoformat())
+            )
+            con.commit()
+            cur.execute(
+                "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
+                (vote_end_2.isoformat(), gid)
+            )
+            con.commit()
+            if ch:
+                # optional: fetch names best-effort
+                def _name(eid: int) -> str:
+                    try:
+                        cur.execute("SELECT name FROM entrant WHERE id=?", (eid,))
+                        r = cur.fetchone()
+                        return r["name"] if r and r["name"] else f"Entrant {eid}"
+                    except:
+                        return f"Entrant {eid}"
+                await ch.send(embed=discord.Embed(
+                    title="🆚 Stylo — Special Match",
+                    description=f"Odd winners this round: **{_name(leftover_winner)}** battles a wildcard for a slot in the next round.",
+                    colour=EMBED_COLOUR
+                ))
+            await post_round_matches(ev, cur_round, vote_end_2, con, cur)
+            return
+        else:
+            # no opponent -> let the leftover winner pass as a bye
+            all_winners_this_round.append(leftover_winner)
+
     # build next round
     if len(all_winners_this_round) >= 2:
         random.shuffle(all_winners_this_round)
-        new_round = ev["round_index"] + 1
-        vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+        new_round = cur_round + 1
         vote_end = now + timedelta(seconds=vote_sec)
 
         for i in range(0, len(all_winners_this_round), 2):
             if i + 1 < len(all_winners_this_round):
                 cur.execute(
                     "INSERT INTO match(guild_id, round_index, left_id, right_id, end_utc) VALUES(?,?,?,?,?)",
-                    (ev["guild_id"], new_round, all_winners_this_round[i], all_winners_this_round[i+1], vote_end.isoformat())
+                    (gid, new_round, all_winners_this_round[i], all_winners_this_round[i+1], vote_end.isoformat())
                 )
         con.commit()
 
         cur.execute(
             "UPDATE event SET round_index=?, entry_end_utc=?, state='voting' WHERE guild_id=?",
-            (new_round, vote_end.isoformat(), ev["guild_id"])
+            (new_round, vote_end.isoformat(), gid)
         )
         con.commit()
 
@@ -1270,7 +1385,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
                 except Exception as e:
                     print("[stylo] Failed to lock main chat:", e)
 
-            await post_round_matches(ev, new_round, vote_end, con, cur)
+        await post_round_matches(ev, new_round, vote_end, con, cur)
         return
 
     # nothing to advance
@@ -1283,7 +1398,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             ))
         except:
             pass
-    cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+    cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (gid,))
     con.commit()
 
 
@@ -1578,11 +1693,9 @@ async def scheduler():
         print(f"[stylo] ERROR voting-end: {e!r}")
         traceback.print_exc(file=sys.stderr)
 
-
 @scheduler.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
-
 
 # ---------------- Ready ----------------
 @bot.event
@@ -1602,7 +1715,6 @@ async def on_ready():
     if not scheduler.is_running():
         scheduler.start()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
