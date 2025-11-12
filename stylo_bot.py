@@ -95,6 +95,13 @@ def init_db():
         guild_id           INTEGER PRIMARY KEY,
         ticket_category_id INTEGER
     );
+    
+    CREATE TABLE IF NOT EXISTS bump_panel (
+        guild_id INTEGER NOT NULL,
+        match_id INTEGER NOT NULL,
+        msg_id   INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, msg_id)
+    );  
     """)
     con.commit()
     con.close()
@@ -155,6 +162,83 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
         )
     con.commit()
     con.close()
+async def cleanup_bump_panels(guild: discord.Guild, ch: discord.TextChannel | None):
+    """Delete any temporary voting-bump panels for this guild (if they still exist)."""
+    if not guild:
+        return
+    con = db()
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT msg_id FROM bump_panel WHERE guild_id=?", (guild.id,))
+        rows = cur.fetchall()
+        if not rows:
+            return
+        # Try delete each message (ignore failures)
+        if ch:
+            for r in rows:
+                try:
+                    msg = await ch.fetch_message(r["msg_id"])
+                    await msg.delete()
+                    await asyncio.sleep(0.15)
+                except:
+                    pass
+        cur.execute("DELETE FROM bump_panel WHERE guild_id=?", (guild.id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
+    """
+    Re-post compact voting panels (with live buttons) for all CURRENT-ROUND matches
+    that are still open (winner_id is NULL). These are temporary and cleaned up
+    as soon as the round ends.
+    """
+    if not (guild and ch):
+        return
+
+    con = db()
+    cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT id, left_id, right_id, end_utc FROM match "
+            "WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+            (ev_row["guild_id"], ev_row["round_index"])
+        )
+        open_matches = cur.fetchall()
+        if not open_matches:
+            return
+
+        for m in open_matches:
+            # names
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
+            Lname = (cur.fetchone() or {}).get("name", "Left") if hasattr(sqlite3.Row, "get") else (cur.fetchone()["name"] if cur.fetchone() else "Left")
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
+            Rname_row = cur.fetchone()
+            Rname = Rname_row["name"] if (Rname_row and "name" in Rname_row.keys()) else "Right"
+
+            # end time
+            end_dt = datetime.fromisoformat(m["end_utc"]).replace(tzinfo=timezone.utc)
+
+            em = discord.Embed(
+                title=f"🗳 Voting panel — Round {ev_row['round_index']}",
+                description=f"**{Lname}** vs **{Rname}**\nCloses {rel_ts(end_dt)}",
+                colour=EMBED_COLOUR
+            )
+            view = MatchView(m["id"], end_dt, Lname, Rname)
+
+            try:
+                sent = await ch.send(embed=em, view=view)
+                cur.execute(
+                    "INSERT OR IGNORE INTO bump_panel(guild_id, match_id, msg_id) VALUES(?,?,?)",
+                    (ev_row["guild_id"], m["id"], sent.id)
+                )
+                con.commit()
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                print("[stylo] bump panel send failed:", e)
+    finally:
+        con.close()
 
 
 # ---------------- VS Card (side-by-side) ----------------
@@ -783,25 +867,34 @@ async def maybe_bump_stylo_panel(message: discord.Message):
     if not ev:
         return
 
+    # Only react in the configured main channel
     if ev["main_channel_id"] != message.channel.id:
-        return
-
-    if ev["state"] != "entry":
         return
 
     cid = message.channel.id
     count = stylo_chat_counters.get(cid, 0) + 1
     stylo_chat_counters[cid] = count
 
-    if count >= STYLO_CHAT_BUMP_LIMIT:
-        stylo_chat_counters[cid] = 0
-        await send_stylo_status(
-            message.guild,
-            message.channel,
-            ev,
-            entries_open=True,
-            join_enabled=True,
-        )
+    # ENTRY: bump the Join panel as you already do
+    if ev["state"] == "entry":
+        if count >= STYLO_CHAT_BUMP_LIMIT:
+            stylo_chat_counters[cid] = 0
+            await send_stylo_status(
+                message.guild,
+                message.channel,
+                ev,
+                entries_open=True,
+                join_enabled=True,
+            )
+        return
+
+    # VOTING: bump compact voting panels (temporary)
+    if ev["state"] == "voting":
+        if count >= STYLO_CHAT_BUMP_LIMIT:
+            stylo_chat_counters[cid] = 0
+            await bump_voting_panels(message.guild, message.channel, ev)
+        return
+
 
 
 # ---------------- Commands ----------------
@@ -1062,6 +1155,7 @@ async def stylo_finish_round_now(inter: discord.Interaction):
         return
 
     # no ties -> advance like scheduler does
+    await cleanup_bump_panels(guild, ch)
     await advance_to_next_round(ev, now, con, cur, guild, ch)
     con.close()
     await inter.followup.send("Round finished.", ephemeral=True)
@@ -1685,6 +1779,7 @@ async def scheduler():
                 continue
 
             # no ties -> advance
+            await cleanup_bump_panels(guild, ch)
             await advance_to_next_round(ev, now, con, cur, guild, ch)
 
         con.close()
