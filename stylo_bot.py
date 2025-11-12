@@ -2213,6 +2213,35 @@ async def scheduler():
 async def _wait_ready():
     await bot.wait_until_ready()
 
+@bot.tree.command(name="stylo_state", description="Show current Stylo state for this guild (ephemeral).")
+async def stylo_state(inter: discord.Interaction):
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
+    ev = cur.fetchone()
+    con.close()
+
+    if not ev:
+        await inter.response.send_message("No event row found for this guild.", ephemeral=True)
+        return
+
+    try:
+        end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+        left = int((end - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        end, left = None, None
+
+    lines = [
+        f"state: **{ev['state']}**",
+        f"round_index: **{ev['round_index']}**",
+        f"entry_end_utc: **{ev['entry_end_utc']}**" + (f" (T-{left}s)" if left is not None else ""),
+        f"vote_hours: **{ev['vote_hours']}**  vote_seconds: **{ev['vote_seconds']}**",
+        f"main_channel_id: **{ev['main_channel_id']}**",
+        f"start_msg_id: **{ev['start_msg_id']}**",
+        f"round_thread_id: **{ev['round_thread_id']}**",
+        f"DB_PATH: **{DB_PATH}**",
+    ]
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
 # ---------------- Ready ----------------
 @bot.event
 async def on_ready():
