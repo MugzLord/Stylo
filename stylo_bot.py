@@ -820,6 +820,133 @@ class MatchView(discord.ui.View):
             if isinstance(c, discord.ui.Button):
                 c.disabled = True
 
+class EntrantModal(discord.ui.Modal, title="Join Stylo"):
+    display_name = discord.ui.TextInput(
+        label="Your display name",
+        max_length=50,
+        required=True,
+        placeholder="e.g., Mike / MikeyMoon"
+    )
+    caption = discord.ui.TextInput(
+        label="Caption (optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=300,
+        placeholder="Short note about your look"
+    )
+
+    def __init__(self, inter: discord.Interaction):
+        super().__init__()
+        self._origin = inter
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not inter.guild:
+            await inter.response.send_message("Guild context missing.", ephemeral=True)
+            return
+
+        name = (str(self.display_name).strip() or inter.user.display_name)[:50]
+        cap  = (str(self.caption).strip() or None)
+
+        # Upsert entrant for this guild+user
+        con = db(); cur = con.cursor()
+        try:
+            cur.execute(
+                "INSERT OR IGNORE INTO entrant(guild_id, user_id, name, caption, image_url) "
+                "VALUES(?,?,?,?,NULL)",
+                (inter.guild_id, inter.user.id, name, cap)
+            )
+            cur.execute(
+                "UPDATE entrant SET name=?, caption=? WHERE guild_id=? AND user_id=?",
+                (name, cap, inter.guild_id, inter.user.id)
+            )
+            con.commit()
+
+            cur.execute("SELECT id FROM entrant WHERE guild_id=? AND user_id=?",
+                        (inter.guild_id, inter.user.id))
+            row = cur.fetchone()
+            if not row:
+                await inter.response.send_message("Couldn’t register you. Try again.", ephemeral=True)
+                return
+            entrant_id = row["id"]
+        finally:
+            con.close()
+
+        # Create (or reuse) a private ticket channel so the user can upload their image
+        guild = inter.guild
+        me = guild.me
+        member = inter.user
+
+        # Reuse existing ticket if present
+        con = db(); cur = con.cursor()
+        try:
+            cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
+            trow = cur.fetchone()
+        finally:
+            con.close()
+
+        ch = None
+        if trow:
+            maybe = guild.get_channel(trow["channel_id"])
+            if isinstance(maybe, discord.TextChannel):
+                ch = maybe
+
+        if ch is None:
+            # Pick category: configured one if set; otherwise current channel’s category
+            cat_id = get_ticket_category_id(guild.id)
+            category = guild.get_channel(cat_id) if cat_id else None
+            if not isinstance(category, discord.CategoryChannel):
+                base = inter.channel if isinstance(inter.channel, discord.TextChannel) else (
+                    inter.channel.parent if isinstance(inter.channel, discord.Thread) else None
+                )
+                category = base.category if isinstance(base, discord.TextChannel) else None
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                member: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+                me: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True, manage_channels=True),
+            }
+
+            safe_name = f"stylo-{member.name}".lower().replace(" ", "-")[:90]
+            try:
+                ch = await guild.create_text_channel(
+                    safe_name,
+                    category=category if isinstance(category, discord.CategoryChannel) else None,
+                    overwrites=overwrites,
+                    reason="Stylo: create entry ticket"
+                )
+            except discord.Forbidden:
+                ch = await guild.create_text_channel(
+                    safe_name,
+                    overwrites=overwrites,
+                    reason="Stylo: create entry ticket"
+                )
+
+            # Save ticket row
+            con = db(); cur = con.cursor()
+            try:
+                cur.execute("INSERT OR REPLACE INTO ticket(entrant_id, channel_id) VALUES(?,?)",
+                            (entrant_id, ch.id))
+                con.commit()
+            finally:
+                con.close()
+
+            try:
+                await ch.send(
+                    f"Hi {member.mention}! 👋\n"
+                    "Upload a **square** image for your look in this ticket. "
+                    "Your latest image here will be used for Stylo."
+                )
+            except Exception:
+                pass
+
+        # Confirm back to the user
+        jump = ch.jump_url if ch else ""
+        await inter.response.send_message(
+            f"✅ You’re in, **{name}**!\n"
+            f"Open your ticket to upload your image: {jump or f'<#{ch.id}>'}\n"
+            "Reminder: **square** image works best. Re-upload anytime; the latest will be used.",
+            ephemeral=True
+        )
 
 # ---------------- Start modal ----------------
 class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
