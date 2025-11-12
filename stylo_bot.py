@@ -211,6 +211,19 @@ async def lock_main_chat(guild: discord.Guild):
                 add_reactions=True
             )
 
+    # allow the bot itself to talk & thread
+    bot_member = guild.me
+    if bot_member:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            send_messages=True,
+            add_reactions=True,
+            create_public_threads=True,
+            create_private_threads=True,
+            send_messages_in_threads=True,
+            manage_threads=True  # optional, helpful for archiving
+        )
+
+
     await ch.edit(overwrites=overwrites)
     
 async def unlock_main_chat(guild: discord.Guild):
@@ -256,27 +269,63 @@ async def cleanup_bump_panels(guild: discord.Guild, ch: discord.TextChannel | No
         con.close()
 
 async def ensure_round_chat_thread(guild: discord.Guild, fallback_channel: discord.TextChannel) -> discord.Thread:
+    # Prefer a dedicated channel if set; else use the fallback (where you post pairs)
     host_ch = guild.get_channel(ROUND_CHAT_CHANNEL_ID) if ROUND_CHAT_CHANNEL_ID else fallback_channel
     if not isinstance(host_ch, discord.TextChannel):
-        host_ch = fallback_channel
+        host_ch = fallback_channel  # never host on a Thread
 
-    # Find existing open thread
+    # quick perms check for the bot in host_ch
+    perms = host_ch.permissions_for(guild.me)
+    if not (perms.send_messages and (perms.create_public_threads or perms.create_private_threads)):
+        # try to open it up just for the bot so we can proceed
+        try:
+            ow = host_ch.overwrites or {}
+            ow[guild.me] = discord.PermissionOverwrite(
+                send_messages=True,
+                add_reactions=True,
+                create_public_threads=True,
+                create_private_threads=True,
+                send_messages_in_threads=True
+            )
+            await host_ch.edit(overwrites=ow)
+        except Exception:
+            # if we still can’t, fall back to the fallback_channel with perms check
+            host_ch = fallback_channel
+            perms = host_ch.permissions_for(guild.me)
+            if not (perms.send_messages and (perms.create_public_threads or perms.create_private_threads)):
+                raise RuntimeError("Bot lacks permissions to create Round Chat thread in both host and fallback channels")
+
+    # find existing open thread by name
     try:
         async for th in host_ch.active_threads():
-            if th.name == ROUND_CHAT_THREAD_NAME and not th.locked:
+            if th.name == ROUND_CHAT_THREAD_NAME and not th.locked and not th.archived:
                 return th
     except Exception:
         pass
 
-    # Create new thread
-    seed_msg = await host_ch.send("🧵 Round chat is here. Keep voting posts clean.")
-    th = await host_ch.create_thread(
-        name=ROUND_CHAT_THREAD_NAME,
-        message=seed_msg,
-        auto_archive_duration=1440  # 24h
-    )
-    await th.send("Chat about this round here. Votes via buttons on pair posts. 👍")
-    return th
+    # create via seed message (preferred)
+    try:
+        seed_msg = await host_ch.send("🧵 Round chat is here. Keep voting posts clean.")
+        th = await host_ch.create_thread(
+            name=ROUND_CHAT_THREAD_NAME,
+            message=seed_msg,
+            auto_archive_duration=1440  # 24h
+        )
+        await th.send("Chat about this round here. Votes via buttons on pair posts. 👍")
+        return th
+    except discord.Forbidden:
+        # fallback: create a thread without a seed message (some servers disallow sends but allow thread create)
+        try:
+            th = await host_ch.create_thread(
+                name=ROUND_CHAT_THREAD_NAME,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440
+            )
+            await th.send("Chat about this round here. Votes via buttons on pair posts. 👍")
+            return th
+        except Exception as e:
+            raise e
+
 
 
 async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
