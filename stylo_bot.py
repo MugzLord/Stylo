@@ -1035,7 +1035,14 @@ class EntrantModal(discord.ui.Modal, title="Join Stylo"):
 
 
 # ---------------- Helper: post matches ----------------
+# ---------------- Helper: post matches ----------------
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
+    """
+    Posts every match for the given round.
+    - Attaches a MatchView with a working 'Chat here' link (event-wide thread).
+    - Sends a side-by-side card when both images exist, otherwise sends each image under the header.
+    - Stores msg_id back into the match row.
+    """
     guild = bot.get_guild(ev["guild_id"])
     ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
     if not (guild and ch):
@@ -1049,6 +1056,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         thread_id = None
     chat_url = get_event_chat_url(guild, thread_id) if thread_id else None
 
+    # Fetch matches that haven't been posted yet
     cur.execute(
         "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
         (ev["guild_id"], round_index)
@@ -1062,11 +1070,12 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
         R = cur.fetchone()
 
-        Lname = L["name"] if L else "Left"
-        Rname = R["name"] if R else "Right"
-        Lurl = (L["image_url"] or "").strip() if L else ""
-        Rurl = (R["image_url"] or "").strip() if R else ""
+        Lname = (L["name"] if L and "name" in L.keys() else "Left")
+        Rname = (R["name"] if R and "name" in R.keys() else "Right")
+        Lurl  = (L["image_url"] or "").strip() if L else ""
+        Rurl  = (R["image_url"] or "").strip() if R else ""
 
+        # Header embed
         em = discord.Embed(
             title=f"Round {round_index} — {Lname} vs {Rname}",
             description="Tap a button to vote. One vote per person.",
@@ -1075,17 +1084,23 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
         em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
 
-        view2 = MatchView(m["id"], new_end, LN, RN, chat_url=tie_chat_url)
+        # Voting buttons (+ chat link)
+        view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
+
         try:
             msg = None
+
+            # Prefer a single side-by-side card if both images are present
             if Lurl and Rurl:
                 try:
                     card = await build_vs_card(Lurl, Rurl)
                     file = discord.File(fp=card, filename="versus.png")
+                    em.set_image(url="attachment://versus.png")
                     msg = await ch.send(embed=em, view=view, file=file)
                 except Exception as e_card:
                     print(f"[stylo] VS card failed for match {m['id']}: {e_card!r}")
 
+            # Fallback: header first, then send each image separately (or a placeholder)
             if msg is None:
                 header = await ch.send(embed=em, view=view)
                 msg = header
@@ -1122,6 +1137,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
 
         except Exception as send_err:
             print(f"[stylo] send failed for match {m['id']}: {send_err!r}")
+            # Ultra-fallback: post a minimal message so voting still works
             try:
                 fallback_em = discord.Embed(
                     title=f"Round {round_index} — {Lname} vs {Rname}",
@@ -1136,6 +1152,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 print(f"[stylo] EVEN FALLBACK failed for match {m['id']}: {e2!r}")
                 continue
 
+        # Record the message id back to DB
         try:
             cur.execute("UPDATE match SET msg_id=?, thread_id=NULL WHERE id=?", (msg.id, m["id"]))
             con.commit()
@@ -1143,6 +1160,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
             print(f"[stylo] DB update failed for match {m['id']}: {e_db!r}")
 
         await asyncio.sleep(0.25)
+
 
      
 async def send_stylo_status(guild: discord.Guild, ch: discord.TextChannel, ev, entries_open: bool, join_enabled: bool):
