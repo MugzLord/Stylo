@@ -123,6 +123,45 @@ def init_db():
 
 init_db()
 
+#===========chat button==========#
+async def ensure_event_chat_url(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row) -> str | None:
+    """
+    Ensure the single event-wide chat thread exists and return its jump URL.
+    """
+    if not (guild and ch and ev_row):
+        return None
+
+    th_id = None
+    try:
+        # try read current id
+        th_id = ev_row["round_thread_id"]
+    except Exception:
+        th_id = None
+
+    # If we already have one and it exists, return its URL
+    if th_id:
+        th = guild.get_thread(th_id)
+        if th:
+            return th.jump_url
+
+    # Create the thread now
+    title = f"🗣 Theme Chat — {ev_row['theme']}" if ("theme" in ev_row.keys() and ev_row["theme"]) else "🗣 Theme Chat"
+    try:
+        th = await ch.create_thread(name=title, auto_archive_duration=1440)
+        # save it
+        con = db(); cur = con.cursor()
+        cur.execute("UPDATE event SET round_thread_id=? WHERE guild_id=?", (th.id, ev_row["guild_id"]))
+        con.commit(); con.close()
+
+        await th.send(embed=discord.Embed(
+            title="Supporter Chat",
+            description="Talk here — entries & voting announcements stay in the main channel.",
+            colour=discord.Colour.dark_grey()
+        ))
+        return th.jump_url
+    except Exception as e:
+        print("[stylo] ensure_event_chat_url failed:", e)
+        return None
 
 # ---------------- Utils ----------------
 def rel_ts(dt_utc: datetime) -> str:
