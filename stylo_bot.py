@@ -333,23 +333,71 @@ async def create_ticket_channel(inter: discord.Interaction, entrant_id: int, ent
         return None
 
 class EntrantModal(discord.ui.Modal, title="Join Stylo"):
-    display_name = discord.ui.TextInput(label="Display name", placeholder="Your name for the bracket", max_length=40, required=True)
-    caption      = discord.ui.TextInput(label="Caption (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200)
+    display_name = discord.ui.TextInput(
+        label="Display name",
+        placeholder="Your name for the bracket",
+        max_length=40,
+        required=True
+    )
+    caption = discord.ui.TextInput(
+        label="Caption (optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=200
+    )
 
     def __init__(self, inter: discord.Interaction):
         super().__init__()
         self._origin = inter
 
     async def on_submit(self, inter: discord.Interaction):
+        if not inter.guild:
+            await inter.response.send_message("Guild context missing.", ephemeral=True)
+            return
+
+        # acknowledge quickly so Discord doesn't time out
         await inter.response.defer(ephemeral=True, thinking=False)
+
         name = str(self.display_name).strip() or inter.user.display_name
         cap  = str(self.caption).strip() if self.caption else None
+
+        # make/get entrant then create their ticket channel (your existing helpers)
         entrant_id = await create_or_get_entrant(inter.guild_id, inter.user, name, cap)
         ch_id = await create_ticket_channel(self._origin, entrant_id, name)
+
         if ch_id:
-            await inter.followup.send("Ticket created — please upload your image there.", ephemeral=True)
+            ch = inter.guild.get_channel(ch_id)
+
+            # 1) Tell them EXACTLY where to go (clickable mention)
+            if ch:
+                await inter.followup.send(
+                    f"Ticket created — go to {ch.mention} and upload your **square** image.",
+                    ephemeral=True
+                )
+                # 2) Leave a pinned instruction inside the ticket
+                try:
+                    msg = await ch.send(
+                        f"📌 <@{inter.user.id}> upload your **square** image here. "
+                        "I’ll always use your latest upload."
+                    )
+                    try:
+                        await msg.pin()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            else:
+                # fallback if channel object not resolved
+                await inter.followup.send(
+                    "Ticket created — open your new ticket channel and upload your square image.",
+                    ephemeral=True
+                )
         else:
-            await inter.followup.send("Couldn’t create your ticket. Check bot permissions on the ticket category.", ephemeral=True)
+            await inter.followup.send(
+                "Couldn’t create your ticket. Check the bot has **Manage Channels** on the configured ticket category.",
+                ephemeral=True
+            )
+
 
 # ---------------- Join button (persistent view) ----------------
 def build_join_view(enabled: bool = True) -> discord.ui.View:
