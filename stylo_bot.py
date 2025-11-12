@@ -841,19 +841,6 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
             ev = cur.fetchone()
 
 
-        # Disable any older Join panels in this channel to avoid stale buttons
-        try:
-            async for old in inter.channel.history(limit=50):
-                if old.id == sent.id:
-                    continue
-                if old.author == bot.user and old.components:
-                    try:
-                        await old.edit(view=build_join_view(False))
-                    except:
-                        pass
-        except:
-            pass
-
             # No row? Tell the user what’s wrong instead of the generic line.
             if not ev:
                 con.close()
