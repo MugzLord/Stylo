@@ -23,14 +23,15 @@ OWNER_ID = int(os.getenv("STYLO_OWNER_ID", "0"))
 STYLO_CHAT_BUMP_LIMIT = 10
 stylo_chat_counters: dict[int, int] = {}
 
+ROUND_CHAT_CHANNEL_ID = int(os.getenv("STYLO_CHAT_CHANNEL_ID", "0"))  # optional fixed host channel
+ROUND_CHAT_THREAD_NAME = "stylo-round-chat"
+ROUND_CHAT_FALLBACK_CH_NAME = "stylo-round-chat"  # used if we must create a text channel
+
+
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.guilds = True
 INTENTS.members = True
-
-# --- Single Round Chat config ---
-ROUND_CHAT_THREAD_NAME = "stylo-round-chat"
-
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
@@ -267,6 +268,110 @@ async def cleanup_bump_panels(guild: discord.Guild, ch: discord.TextChannel | No
         con.commit()
     finally:
         con.close()
+
+async def get_or_make_round_chat(guild: discord.Guild, fallback_channel: discord.TextChannel) -> discord.abc.GuildChannel:
+    """
+    Returns a channel-like object with .jump_url (Thread OR TextChannel) that acts as the Round Chat.
+    Order:
+      1) Use ROUND_CHAT_CHANNEL_ID if valid, else fallback_channel
+      2) Try to find existing open thread named ROUND_CHAT_THREAD_NAME
+      3) Try to create a new thread off a seed message
+      4) If threads are blocked, create a dedicated TEXT CHANNEL 'stylo-round-chat'
+    """
+
+    # Choose a host text channel (never a thread)
+    host_ch = guild.get_channel(ROUND_CHAT_CHANNEL_ID) if ROUND_CHAT_CHANNEL_ID else fallback_channel
+    if not isinstance(host_ch, discord.TextChannel):
+        # last resort: pick guild's first text channel
+        host_ch = next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+        if host_ch is None:
+            raise RuntimeError("No usable text channel for Round Chat.")
+
+    # Ensure bot has explicit allow perms on host channel
+    try:
+        ow = host_ch.overwrites or {}
+        ow[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            add_reactions=True,
+            create_public_threads=True,
+            create_private_threads=True,
+            send_messages_in_threads=True,
+            manage_threads=True
+        )
+        await host_ch.edit(overwrites=ow)
+    except Exception:
+        pass  # not fatal; we'll still try
+
+    # 1) Reuse existing active/open thread
+    try:
+        async for th in host_ch.active_threads():
+            if th.name == ROUND_CHAT_THREAD_NAME and not th.locked and not th.archived:
+                return th
+    except Exception:
+        pass
+
+    # 2) Try to create a thread from a seed message
+    perms = host_ch.permissions_for(guild.me)
+    if perms.send_messages and (perms.create_public_threads or perms.create_private_threads):
+        try:
+            seed = await host_ch.send("🧵 Round chat is here. Keep voting posts clean.")
+            th = await host_ch.create_thread(
+                name=ROUND_CHAT_THREAD_NAME,
+                message=seed,
+                auto_archive_duration=1440
+            )
+            await th.send("Chat about this round here. Votes via buttons on pair posts. 👍")
+            return th
+        except discord.Forbidden:
+            pass
+        except Exception:
+            pass
+
+        # Thread sans seed (some servers block sending but allow thread create)
+        try:
+            th = await host_ch.create_thread(
+                name=ROUND_CHAT_THREAD_NAME,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440
+            )
+            await th.send("Chat about this round here. Votes via buttons on pair posts. 👍")
+            return th
+        except Exception:
+            pass
+
+    # 3) Fallback: make a dedicated TEXT CHANNEL (guaranteed space)
+    try:
+        # Try to locate an existing text channel with the same name
+        existing = discord.utils.get(guild.text_channels, name=ROUND_CHAT_FALLBACK_CH_NAME)
+        if existing:
+            # make sure bot can speak
+            ow = existing.overwrites or {}
+            ow[guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                add_reactions=True,
+                send_messages_in_threads=True,
+            )
+            await existing.edit(overwrites=ow)
+            await existing.send("🧵 Round chat is open here (fallback channel).")
+            return existing
+
+        # Create under same category if possible
+        cat = host_ch.category
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        new_ch = await guild.create_text_channel(
+            name=ROUND_CHAT_FALLBACK_CH_NAME,
+            category=cat,
+            overwrites=overwrites
+        )
+        await new_ch.send("🧵 Round chat is open here (fallback channel).")
+        return new_ch
+    except Exception as e:
+        raise RuntimeError(f"Failed to create any Round Chat target: {e}")
 
 async def ensure_round_chat_thread(guild: discord.Guild, fallback_channel: discord.TextChannel) -> discord.Thread:
     # Prefer a dedicated channel if set; else use the fallback (where you post pairs)
@@ -1486,7 +1591,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             if ch:
                 await ch.send(embed=discord.Embed(
                     title="🆚 Stylo — Special Match",
-                    description="Odd number of looks, so the spare look battles a wildcard opponent.",
+                    description="The extra one goes head-to-head with a wildcard..",
                     colour=EMBED_COLOUR
                 ))
             await post_round_matches(ev, cur_round, vote_end_2, con, cur)
