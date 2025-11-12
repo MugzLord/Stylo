@@ -121,17 +121,6 @@ def init_db():
     except Exception:
         pass  # already there
 
-    # --- (if you already added bump_panel earlier, keep it; else create it) ---
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS bump_panel (
-        guild_id INTEGER NOT NULL,
-        match_id INTEGER NOT NULL,
-        msg_id   INTEGER NOT NULL,
-        PRIMARY KEY (guild_id, msg_id)
-    );
-    """)
-
-
 init_db()
 
 
