@@ -832,21 +832,51 @@ class StyloStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         self._origin = inter
 
     async def on_submit(self, inter: discord.Interaction):
-        if not is_admin(inter.user):
-            await inter.response.send_message("Admins only.", ephemeral=True)
+        if not inter.guild:
+            await inter.response.send_message("Guild context missing.", ephemeral=True)
             return
         try:
-            try:
-                await inter.response.defer(ephemeral=False)
-            except discord.InteractionResponded:
-                pass
+            con = db(); cur = con.cursor()
+            cur.execute("SELECT * FROM event WHERE guild_id=?", (inter.guild_id,))
+            ev = cur.fetchone()
 
-            entry_sec = parse_duration_to_seconds(str(self.entry_hours), default_unit="h")
-            vote_sec = parse_duration_to_seconds(str(self.vote_hours), default_unit="h")
-            theme = str(self.theme).strip()
-            if not theme:
-                await inter.followup.send("Theme is required.", ephemeral=True)
+
+        # Disable any older Join panels in this channel to avoid stale buttons
+        try:
+            async for old in inter.channel.history(limit=50):
+                if old.id == sent.id:
+                    continue
+                if old.author == bot.user and old.components:
+                    try:
+                        await old.edit(view=build_join_view(False))
+                    except:
+                        pass
+        except:
+            pass
+
+            # No row? Tell the user what’s wrong instead of the generic line.
+            if not ev:
+                con.close()
+                await inter.response.send_message("No active Stylo found here. Ask an admin to start one.", ephemeral=True)
                 return
+    
+            # Treat entries as open if either:
+            #   - state='entry', OR
+            #   - we still haven't hit entry_end_utc (even if state got nudged)
+            now = datetime.now(timezone.utc)
+            entry_end = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
+            entries_open = (ev["state"] == "entry") or (now < entry_end)
+    
+            if not entries_open:
+                # clearer reason for users
+                left = int((entry_end - now).total_seconds())
+                reason = f"state={ev['state']}"
+                if left > 0:
+                    reason += f", closes in {left}s"
+                await inter.response.send_message(f"Entries are not open ({reason}).", ephemeral=True)
+                con.close()
+                return
+
 
             now_utc = datetime.now(timezone.utc)
             entry_end = now_utc + timedelta(seconds=entry_sec)
