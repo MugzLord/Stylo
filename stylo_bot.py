@@ -1041,15 +1041,13 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
     if not (guild and ch):
         return
 
-    # make sure the single event-wide chat exists and get its URL
+    # Ensure ONE event-wide chat thread exists, get its URL
     try:
-        thread_id = await ensure_event_chat_thread(guild, ch, ev)  # ensure + store id
+        thread_id = await ensure_event_chat_thread(guild, ch, ev)  # stores id in DB if new
     except Exception as e:
         print("[stylo] ensure event chat thread failed:", e)
         thread_id = None
-
     chat_url = get_event_chat_url(guild, thread_id) if thread_id else None
-
 
     cur.execute(
         "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
@@ -1058,7 +1056,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
     matches = cur.fetchall()
 
     for m in matches:
-        # ---- names/urls (no raises) ----
+        # names/urls
         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
         L = cur.fetchone()
         cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
@@ -1077,11 +1075,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
         em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
 
-        chat_url = get_event_chat_url(guild, ev["round_thread_id"]) if ("round_thread_id" in ev.keys() and ev["round_thread_id"]) else None
-        view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
-
-        
-        # ---- send the primary message (ONLY this block can post a fallback) ----
+        view2 = MatchView(m["id"], new_end, LN, RN, chat_url=tie_chat_url)
         try:
             msg = None
             if Lurl and Rurl:
@@ -1096,8 +1090,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 header = await ch.send(embed=em, view=view)
                 msg = header
 
-                embeds = []
-                files = []
+                embeds, files = [], []
 
                 if Lurl:
                     Lbytes = await fetch_image_bytes(Lurl)
@@ -1128,7 +1121,6 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                         await ch.send(embeds=embeds)
 
         except Exception as send_err:
-            # Only if the main send failed do we post a fallback ONCE
             print(f"[stylo] send failed for match {m['id']}: {send_err!r}")
             try:
                 fallback_em = discord.Embed(
@@ -1142,9 +1134,8 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                 msg = await ch.send(embed=fallback_em, view=view)
             except Exception as e2:
                 print(f"[stylo] EVEN FALLBACK failed for match {m['id']}: {e2!r}")
-                continue  # move to next match
+                continue
 
-        # ---- immediately persist msg_id so we never repost this match ----
         try:
             cur.execute("UPDATE match SET msg_id=?, thread_id=NULL WHERE id=?", (msg.id, m["id"]))
             con.commit()
