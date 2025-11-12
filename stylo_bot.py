@@ -540,8 +540,6 @@ async def ensure_round_chat_thread(guild: discord.Guild, fallback_channel: disco
         except Exception as e:
             raise e
 
-
-
 async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
     """
     Re-post compact voting panels (with live buttons) for all CURRENT-ROUND matches
@@ -550,6 +548,14 @@ async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_r
     """
     if not (guild and ch):
         return
+
+    # Ensure the single event-wide chat exists and get its jump URL
+    try:
+        thread_id = await ensure_event_chat_thread(guild, ch, ev_row)
+    except Exception as e:
+        print("[stylo] bump: ensure event chat failed:", e)
+        thread_id = None
+    chat_url = get_event_chat_url(guild, thread_id) if thread_id else None
 
     con = db()
     cur = con.cursor()
@@ -566,10 +572,12 @@ async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_r
         for m in open_matches:
             # names
             cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
-            Lname = (cur.fetchone() or {}).get("name", "Left") if hasattr(sqlite3.Row, "get") else (cur.fetchone()["name"] if cur.fetchone() else "Left")
+            Lrow = cur.fetchone()
+            Lname = (Lrow["name"] if (Lrow and "name" in Lrow.keys()) else "Left")
+
             cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
-            Rname_row = cur.fetchone()
-            Rname = Rname_row["name"] if (Rname_row and "name" in Rname_row.keys()) else "Right"
+            Rrow = cur.fetchone()
+            Rname = (Rrow["name"] if (Rrow and "name" in Rrow.keys()) else "Right")
 
             # end time
             end_dt = datetime.fromisoformat(m["end_utc"]).replace(tzinfo=timezone.utc)
@@ -579,7 +587,7 @@ async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_r
                 description=f"**{Lname}** vs **{Rname}**\nCloses {rel_ts(end_dt)}",
                 colour=EMBED_COLOUR
             )
-            view = MatchView(m["id"], end_dt, Lname, Rname)
+            view = MatchView(m["id"], end_dt, Lname, Rname, chat_url=chat_url)
 
             try:
                 sent = await ch.send(embed=em, view=view)
@@ -1033,12 +1041,12 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
 
     # make sure the single event-wide chat exists and get its URL
     try:
-        await ensure_event_chat_thread(guild, ch, ev)  # <-- was ensure_round_chat_thread(..., ev)
+        thread_id = await ensure_event_chat_thread(guild, ch, ev)  # ensure + store id
     except Exception as e:
-        print("[stylo] ensure round chat failed:", e)
+        print("[stylo] ensure event chat thread failed:", e)
+        thread_id = None
 
-    chat_url = get_event_chat_url(guild, ev["round_thread_id"]) if ("round_thread_id" in ev.keys() and ev["round_thread_id"]) else None
-    # (rest of function stays the same; pass chat_url into MatchView as you already do)
+    chat_url = get_event_chat_url(guild, thread_id) if thread_id else None
 
 
     cur.execute(
@@ -1738,9 +1746,22 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     # unlock chat
     if ch and guild:
         try:
-            await ch.set_permissions(guild.default_role, send_messages=True)
-        except:
-            pass
+            await ch.send(embed=discord.Embed(
+                title="🆚 Stylo — Round 1 begins!",
+                description=f"All matches posted. Voting closes {rel_ts(vote_end)}.\nMain chat is now **locked** — use each match thread.",
+                colour=EMBED_COLOUR
+            ))
+            await ch.set_permissions(guild.default_role, send_messages=False)
+    
+            # 👇 add this
+            try:
+                await post_chat_floating_panel(guild, ch, ev)
+            except Exception as e:
+                print("[stylo] chat floating panel failed (r1):", e)
+    
+        except Exception as e:
+            print("[stylo] Failed to announce/lock chat:", e)
+
 
     # champion?
     if len(all_winners_this_round) == 1 and not leftover_ids:
@@ -1865,6 +1886,14 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
                     await ch.set_permissions(guild.default_role, send_messages=False)
                 except Exception as e:
                     print("[stylo] Failed to lock main chat:", e)
+        
+                # 👇 add this
+                try:
+                    await post_chat_floating_panel(guild, ch, ev)
+                except Exception as e:
+                    print("[stylo] chat floating panel failed (r{new_round}):", e)
+
+
 
         await post_round_matches(ev, new_round, vote_end, con, cur)
         return
