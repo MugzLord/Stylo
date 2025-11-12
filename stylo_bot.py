@@ -626,32 +626,72 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
 
 async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
-    th_id = await ensure_event_chat_thread(guild, ch, ev_row)
-    url = chat_jump_url(guild, th_id)
+    """Post a small 'bump' voting panel only once per open match; never duplicates the main post."""
+    if not (guild and ch and ev_row):
+        return
+
+    # Single event-wide chat thread URL (if it exists)
+    try:
+        thread_id = await ensure_event_chat_thread(guild, ch, ev_row)
+        chat_url = get_event_chat_url(guild, thread_id) if thread_id else None
+    except Exception as e:
+        print("[stylo] bump: ensure event chat failed:", e)
+        chat_url = None
 
     con = db(); cur = con.cursor()
-    cur.execute("SELECT id,left_id,right_id,end_utc FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
-                (ev_row["guild_id"], ev_row["round_index"]))
-    ms = cur.fetchall(); con.close()
-    for m in ms:
-        em = discord.Embed(
-            title=f"🗳 Voting panel — Round {ev_row['round_index']}",
-            description=f"Closes {rel_ts(datetime.fromisoformat(m['end_utc']).replace(tzinfo=timezone.utc))}",
-            colour=EMBED_COLOUR
-        )
-        # names
-        con = db(); cur = con.cursor()
-        cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-        cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
+    try:
+        # Get open matches that are still undecided
+        cur.execute("""
+            SELECT id, left_id, right_id, end_utc, msg_id
+            FROM match
+            WHERE guild_id=? AND round_index=? AND winner_id IS NULL
+        """, (ev_row["guild_id"], ev_row["round_index"]))
+        open_matches = cur.fetchall()
+        if not open_matches:
+            return
+
+        for m in open_matches:
+            # If the main message exists, do NOT bump (avoid double post look)
+            if m["msg_id"]:
+                # additionally ensure we don't have a stale bump saved for this match
+                cur.execute("DELETE FROM bump_panel WHERE guild_id=? AND match_id=?",
+                            (ev_row["guild_id"], m["id"]))
+                con.commit()
+                continue
+
+            # If we already created a bump for this match, skip
+            cur.execute("SELECT 1 FROM bump_panel WHERE guild_id=? AND match_id=? LIMIT 1",
+                        (ev_row["guild_id"], m["id"]))
+            if cur.fetchone():
+                continue
+
+            # Names
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["left_id"],))
+            Lname = (cur.fetchone() or {}).get("name", "Left")
+            cur.execute("SELECT name FROM entrant WHERE id=?", (m["right_id"],))
+            Rname = (cur.fetchone() or {}).get("name", "Right")
+
+            end_dt = datetime.fromisoformat(m["end_utc"]).replace(tzinfo=timezone.utc)
+
+            em = discord.Embed(
+                title=f"🗳 Voting panel — Round {ev_row['round_index']}",
+                description=f"**{Lname}** vs **{Rname}**\nCloses {rel_ts(end_dt)}",
+                colour=EMBED_COLOUR
+            )
+            view = MatchView(m["id"], end_dt, Lname, Rname, chat_url=chat_url)
+
+            try:
+                sent = await ch.send(embed=em, view=view)
+                # remember we already bumped this match so we won't do it again
+                cur.execute("INSERT OR IGNORE INTO bump_panel(guild_id, match_id, msg_id) VALUES(?,?,?)",
+                            (ev_row["guild_id"], m["id"], sent.id))
+                con.commit()
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                print("[stylo] bump panel send failed:", e)
+    finally:
         con.close()
-        view = MatchView(m["id"], datetime.fromisoformat(m["end_utc"]).replace(tzinfo=timezone.utc),
-                         (L['name'] if L else 'Left'), (R['name'] if R else 'Right'), chat_url=url)
-        sent = await ch.send(embed=em, view=view)
-        con = db(); cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO bump_panel(guild_id, match_id, msg_id) VALUES(?,?,?)",
-                    (ev_row["guild_id"], m["id"], sent.id))
-        con.commit(); con.close()
-        await asyncio.sleep(0.15)
+
 
 # ------------- Commands -------------
 @bot.tree.command(name="stylo", description="Start a Stylo challenge (admin only).")
@@ -951,37 +991,60 @@ async def scheduler():
 
     con.close()
 
-    # VOTING END -> RESULTS/NEXT
+    # ------------- VOTING END -> RESULTS/NEXT -------------
     con = db(); cur = con.cursor()
     cur.execute("SELECT * FROM event WHERE state='voting'")
     for ev in cur.fetchall():
-        round_end = datetime.fromisoformat(ev["entry_end_utc"]).astimezone(timezone.utc)
-        if now < round_end:
-            continue
-
-        guild = bot.get_guild(ev["guild_id"])
-        ch = (
-            guild.get_channel(ev["main_channel_id"])
-            if (guild and ev["main_channel_id"])
-            else (guild.system_channel if guild else None)
+        gid = ev["guild_id"]
+        ridx = ev["round_index"]
+    
+        # round ends when the last open match ends
+        cur.execute(
+            "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+            (gid, ridx)
         )
-
+        mx = cur.fetchone()["mx"]
+    
+        if not mx:
+            # no open matches (shouldn't happen, but be safe) -> advance
+            guild = bot.get_guild(gid)
+            ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
+            await cleanup_bump_panels(guild, ch)
+            await advance_to_next_round(ev, datetime.now(timezone.utc), con, cur, guild, ch)
+            continue
+    
+        # robust UTC parse
+        round_end = datetime.fromisoformat(mx).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if now < round_end:
+            continue  # not yet finished
+    
+        guild = bot.get_guild(gid)
+        ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
+    
+        # fetch all undecided matches for this round
         cur.execute(
             "SELECT * FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
-            (ev["guild_id"], ev["round_index"])
+            (gid, ridx)
         )
         ms = cur.fetchall()
-
         vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
+    
         any_revote = False
-
         for m in ms:
             L, R = m["left_votes"], m["right_votes"]
-            cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["left_id"],)); Lrow = cur.fetchone()
-            cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["right_id"]),); Rrow = cur.fetchone()
+    
+            # names + (optional) images
+            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
+            Lrow = cur.fetchone()
+            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
+            Rrow = cur.fetchone()
             Lname = Lrow["name"] if Lrow else "Left"
             Rname = Rrow["name"] if Rrow else "Right"
-
+            Lurl  = (Lrow["image_url"] or "").strip() if Lrow else ""
+            Rurl  = (Rrow["image_url"] or "").strip() if Rrow else ""
+    
+            # TIE -> schedule re-vote with fresh end and reset counts
             if L == R:
                 any_revote = True
                 new_end = now + timedelta(seconds=vote_sec)
@@ -991,44 +1054,72 @@ async def scheduler():
                 )
                 cur.execute("DELETE FROM voter WHERE match_id=?", (m["id"],))
                 con.commit()
-
+    
                 if ch:
-                    await ch.send(
-                        embed=discord.Embed(
+                    try:
+                        # Try VS card if both images present
+                        file = None
+                        if Lurl and Rurl:
+                            card = await build_vs_card(Lurl, Rurl)
+                            file = discord.File(card, filename="tie.png")
+                        em = discord.Embed(
                             title=f"🔁 Tie-break — {Lname} vs {Rname}",
                             description=f"Re-vote open until {rel_ts(new_end)}.",
                             colour=discord.Colour.orange()
-                        ),
-                        view=MatchView(m["id"], new_end, Lname, Rname)
-                    )
+                        )
+                        await ch.send(embed=em, view=MatchView(m["id"], new_end, Lname, Rname), file=file)
+                    except Exception as e:
+                        print("[stylo] tie announce failed:", e)
                 continue
-
+    
+            # NORMAL WINNER
             winner_id = m["left_id"] if L > R else m["right_id"]
-            cur.execute(
-                "UPDATE match SET winner_id=?, end_utc=? WHERE id=?",
-                (winner_id, now.isoformat(), m["id"])
-            )
+            cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?", (winner_id, now.isoformat(), m["id"]))
             con.commit()
-
+    
+            if ch:
+                try:
+                    total = max(1, L + R)
+                    pL = round((L / total) * 100, 1)
+                    pR = round((R / total) * 100, 1)
+                    cur.execute("SELECT user_id, image_url FROM entrant WHERE id=?", (winner_id,))
+                    wrow = cur.fetchone()
+                    winner_mention = f"<@{wrow['user_id']}>" if wrow and wrow["user_id"] else "the winner"
+                    em = discord.Embed(
+                        title=f"🏁 Result — {Lname} vs {Rname}",
+                        description=(f"**{Lname}**: {L} ({pL}%)\n"
+                                     f"**{Rname}**: {R} ({pR}%)\n\n"
+                                     f"🏆 **Winner:** {winner_mention}"),
+                        colour=discord.Colour.green()
+                    )
+                    file = None
+                    wurl = (wrow["image_url"] or "").strip() if wrow else ""
+                    if wurl:
+                        data = await fetch_image_bytes(wurl)
+                        if data:
+                            file = discord.File(io.BytesIO(data), filename=f"winner_{m['id']}.png")
+                            em.set_thumbnail(url=f"attachment://winner_{m['id']}.png")
+                    await ch.send(embed=em, file=file) if file else await ch.send(embed=em)
+                except Exception as e:
+                    print("[stylo] result send error:", e)
+    
         if any_revote:
+            # extend event to the latest re-vote end and stop
             cur.execute(
-                "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=?",
-                (ev["guild_id"], ev["round_index"])
+                "SELECT MAX(end_utc) AS mx FROM match WHERE guild_id=? AND round_index=? AND winner_id IS NULL",
+                (gid, ridx)
             )
-            mx = cur.fetchone()["mx"]
-            if mx:
-                cur.execute(
-                    "UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?",
-                    (mx, ev["guild_id"])
-                )
+            mx2 = cur.fetchone()["mx"]
+            if mx2:
+                cur.execute("UPDATE event SET entry_end_utc=?, state='voting' WHERE guild_id=?", (mx2, gid))
                 con.commit()
             continue
-
+    
+        # no ties -> advance to next round / champion
         await cleanup_bump_panels(guild, ch)
         await advance_to_next_round(ev, now, con, cur, guild, ch)
-
+    
     con.close()
-
 
 # ------------- Setup & Run -------------
 @bot.event
