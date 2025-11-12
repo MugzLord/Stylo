@@ -1793,6 +1793,18 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             else:
                 await ch.send(embed=em)
 
+         # unlock main chat + clean temp panels
+        try:
+            await unlock_main_chat(guild)
+        except Exception as e:
+            print("[stylo] unlock after champion failed:", e)
+
+        try:
+            await cleanup_bump_panels(guild, ch)
+        except Exception as e:
+            print("[stylo] cleanup panels (champion) failed:", e)
+
+
         if guild:
             try:
                 await cleanup_tickets_for_guild(guild, reason="Stylo: finished - deleting tickets")
