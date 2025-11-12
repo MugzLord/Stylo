@@ -49,7 +49,7 @@ def init_db():
     cur = con.cursor()
     cur.executescript("""
     PRAGMA journal_mode=WAL;
-
+    
     CREATE TABLE IF NOT EXISTS event (
         guild_id         INTEGER PRIMARY KEY,
         theme            TEXT NOT NULL,
@@ -115,6 +115,22 @@ def init_db():
     con.commit()
     con.close()
 
+    # --- schema patch: store one chat thread per round ---
+    try:
+        con.execute("ALTER TABLE event ADD COLUMN round_thread_id INTEGER")
+    except Exception:
+        pass  # already there
+
+    # --- (if you already added bump_panel earlier, keep it; else create it) ---
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS bump_panel (
+        guild_id INTEGER NOT NULL,
+        match_id INTEGER NOT NULL,
+        msg_id   INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, msg_id)
+    );
+    """)
+
 
 init_db()
 
@@ -171,6 +187,74 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
         )
     con.commit()
     con.close()
+
+async def ensure_round_chat_thread(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row) -> int | None:
+    """Create (or reuse) a single Supporter Chat thread for the current round."""
+    if not (guild and ch and ev_row):
+        return None
+    if ev_row["round_thread_id"]:
+        # sanity: confirm it still exists
+        th = guild.get_thread(ev_row["round_thread_id"])
+        if th:
+            return th.id
+
+    # Create a public thread directly under the channel
+    try:
+        th = await ch.create_thread(
+            name=f"🗣 Round {ev_row['round_index']} — Chat",
+            auto_archive_duration=1440
+        )
+        # Save it
+        con = db(); cur = con.cursor()
+        cur.execute("UPDATE event SET round_thread_id=? WHERE guild_id=?", (th.id, ev_row["guild_id"]))
+        con.commit(); con.close()
+
+        # First message in the thread
+        await th.send(embed=discord.Embed(
+            title="Supporter Chat",
+            description="Talk here — voting is on the main posts.",
+            colour=discord.Colour.dark_grey()
+        ))
+        return th.id
+    except Exception as e:
+        print("[stylo] create round chat thread failed:", e)
+        return None
+
+
+def get_round_chat_url(guild: discord.Guild, thread_id: int | None) -> str | None:
+    if not (guild and thread_id):
+        return None
+    th = guild.get_thread(thread_id)
+    return th.jump_url if th else None
+
+
+async def post_chat_floating_panel(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
+    """Drop a small 'Chat here' panel with a link button; track it to auto-delete at round end."""
+    if not (guild and ch and ev_row):
+        return
+    # Ensure thread exists
+    thread_id = await ensure_round_chat_thread(guild, ch, ev_row)
+    url = get_round_chat_url(guild, thread_id)
+    if not url:
+        return
+
+    em = discord.Embed(
+        title=f"🗣 Round {ev_row['round_index']} — Supporter Chat",
+        description="Click the button to jump into the chat thread.",
+        colour=discord.Colour.dark_grey()
+    )
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=url, label="Chat here"))
+
+    try:
+        sent = await ch.send(embed=em, view=view)
+        con = db(); cur = con.cursor()
+        # We store match_id=0 to mark 'chat-only' bump
+        cur.execute("INSERT OR IGNORE INTO bump_panel(guild_id, match_id, msg_id) VALUES(?,?,?)",
+                    (ev_row["guild_id"], 0, sent.id))
+        con.commit(); con.close()
+    except Exception as e:
+        print("[stylo] chat floating panel failed:", e)
 
 async def lock_main_chat(guild: discord.Guild):
     ch = guild.get_channel(MAIN_CHAT_CHANNEL_ID)
@@ -578,6 +662,16 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
 
 
 # ---------------- Voting UI ----------------
+class MatchView(discord.ui.View):
+    def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str, chat_url: str | None = None):
+        timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
+        super().__init__(timeout=timeout)
+        self.match_id = match_id
+        self.btn_left.label = f"Vote {left_label}"
+        self.btn_right.label = f"Vote {right_label}"
+        if chat_url:
+            self.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=chat_url, label="Chat here"))
+
 class ChatJumpView(discord.ui.View):
     def __init__(self, chat_url: str, *, timeout: float | None = None):
         super().__init__(timeout=timeout)
@@ -971,23 +1065,18 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                         await ch.send(embeds=embeds, files=files)
                     else:
                         await ch.send(embeds=embeds)
-
-            thread_id = None
+            #
+            # Attach a 'Chat here' link to the round-wide thread (if present)
+            chat_url = get_round_chat_url(guild, ev.get("round_thread_id") if hasattr(ev, "get") else ev["round_thread_id"])
+            # Rebuild the view with chat button
+            view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
             try:
-                thread = await msg.create_thread(
-                    name=f"💬 {Lname} vs {Rname} — Chat",
-                    auto_archive_duration=1440
-                )
-                await thread.send(embed=discord.Embed(
-                    title="Supporter Chat",
-                    description="Talk here — voting is on the parent post.",
-                    colour=discord.Colour.dark_grey()
-                ))
-                thread_id = thread.id
-            except Exception as e:
-                print(f"[stylo] create thread failed for match {m['id']}: {e!r}")
+                await msg.edit(view=view)
+            except:
+                pass
 
-            cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (msg.id, thread_id, m["id"]))
+            cur.execute("UPDATE match SET msg_id=?, thread_id=NULL WHERE id=?", (msg.id, m["id"]))
+
             con.commit()
 
             await asyncio.sleep(0.25)
