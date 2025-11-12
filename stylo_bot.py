@@ -667,6 +667,7 @@ async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -
 
 
 # ---------------- Join button ----------------
+# ---------- FIX 1: Harden Join button against Unknown interaction ----------
 def build_join_view(enabled: bool = True) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     btn = discord.ui.Button(
@@ -679,11 +680,29 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
     async def join_cb(i: discord.Interaction):
         if i.user.bot:
             return
-        await i.response.send_modal(EntrantModal(i))
+        # Try to open the modal. If Discord drops the interaction, fail soft.
+        try:
+            await i.response.send_modal(EntrantModal(i))
+        except discord.errors.NotFound:
+            # 10062: Unknown interaction – usually a timing/restart hiccup
+            try:
+                await i.followup.send("That fizzled. Please tap **Join** again.", ephemeral=True)
+            except Exception:
+                pass
+        except discord.InteractionResponded:
+            # Already acknowledged elsewhere — nothing to do.
+            pass
+        except Exception:
+            # Generic fallback
+            try:
+                await i.response.send_message("Couldn’t open the form. Try again.", ephemeral=True)
+            except Exception:
+                pass
 
     btn.callback = join_cb
     view.add_item(btn)
     return view
+
 
 
 # ---------------- Voting UI ----------------
@@ -1012,12 +1031,15 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
     if not (guild and ch):
         return
 
-    # make sure the single round chat exists and get its URL
+    # make sure the single event-wide chat exists and get its URL
     try:
-        await ensure_round_chat_thread(guild, ch, ev)
+        await ensure_event_chat_thread(guild, ch, ev)  # <-- was ensure_round_chat_thread(..., ev)
     except Exception as e:
         print("[stylo] ensure round chat failed:", e)
-    chat_url = get_round_chat_url(guild, ev["round_thread_id"]) if ("round_thread_id" in ev.keys() and ev["round_thread_id"]) else None
+
+    chat_url = get_event_chat_url(guild, ev["round_thread_id"]) if ("round_thread_id" in ev.keys() and ev["round_thread_id"]) else None
+    # (rest of function stays the same; pass chat_url into MatchView as you already do)
+
 
     cur.execute(
         "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
