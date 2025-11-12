@@ -177,59 +177,56 @@ def set_ticket_category_id(guild_id: int, category_id: int | None):
     con.commit()
     con.close()
 
-async def ensure_round_chat_thread(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row) -> int | None:
-    """Create (or reuse) a single Supporter Chat thread for the current round."""
+async def ensure_event_chat_thread(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row) -> int | None:
+    """
+    Ensure ONE Supporter Chat thread exists for the entire event (theme),
+    reused across all rounds. We store its id in event.round_thread_id.
+    """
     if not (guild and ch and ev_row):
         return None
-    if ev_row["round_thread_id"]:
-        # sanity: confirm it still exists
-        th = guild.get_thread(ev_row["round_thread_id"])
+
+    th_id = ev_row["round_thread_id"] if "round_thread_id" in ev_row.keys() else None
+    if th_id:
+        th = guild.get_thread(th_id)
         if th:
             return th.id
 
-    # Create a public thread directly under the channel
+    title = f"🗣 Theme Chat — {ev_row['theme']}" if ("theme" in ev_row.keys() and ev_row["theme"]) else "🗣 Theme Chat"
     try:
-        th = await ch.create_thread(
-            name=f"🗣 Round {ev_row['round_index']} — Chat",
-            auto_archive_duration=1440
-        )
-        # Save it
+        th = await ch.create_thread(name=title, auto_archive_duration=1440)
+        # save it
         con = db(); cur = con.cursor()
         cur.execute("UPDATE event SET round_thread_id=? WHERE guild_id=?", (th.id, ev_row["guild_id"]))
         con.commit(); con.close()
-
-        # First message in the thread
         await th.send(embed=discord.Embed(
             title="Supporter Chat",
-            description="Talk here — voting is on the main posts.",
+            description="Talk here — entries & voting announcements stay in the main channel.",
             colour=discord.Colour.dark_grey()
         ))
         return th.id
     except Exception as e:
-        print("[stylo] create round chat thread failed:", e)
+        print("[stylo] create event chat thread failed:", e)
         return None
 
 
-def get_round_chat_url(guild: discord.Guild, thread_id: int | None) -> str | None:
+def get_event_chat_url(guild: discord.Guild, thread_id: int | None) -> str | None:
     if not (guild and thread_id):
         return None
     th = guild.get_thread(thread_id)
     return th.jump_url if th else None
 
-
 async def post_chat_floating_panel(guild: discord.Guild, ch: discord.TextChannel, ev_row: sqlite3.Row):
-    """Drop a small 'Chat here' panel with a link button; track it to auto-delete at round end."""
+    """Drop a small 'Chat here' panel linking to the event-wide chat thread; auto-deleted at round end/close."""
     if not (guild and ch and ev_row):
         return
-    # Ensure thread exists
-    thread_id = await ensure_round_chat_thread(guild, ch, ev_row)
-    url = get_round_chat_url(guild, thread_id)
+    thread_id = await ensure_event_chat_thread(guild, ch, ev_row)
+    url = get_event_chat_url(guild, thread_id)
     if not url:
         return
 
     em = discord.Embed(
-        title=f"🗣 Round {ev_row['round_index']} — Supporter Chat",
-        description="Click the button to jump into the chat thread.",
+        title="🗣 Theme Chat",
+        description="Click to jump into the Supporter Chat thread for this theme.",
         colour=discord.Colour.dark_grey()
     )
     view = discord.ui.View(timeout=None)
@@ -238,7 +235,7 @@ async def post_chat_floating_panel(guild: discord.Guild, ch: discord.TextChannel
     try:
         sent = await ch.send(embed=em, view=view)
         con = db(); cur = con.cursor()
-        # We store match_id=0 to mark 'chat-only' bump
+        # Store match_id=0 to mark 'chat-only' bump
         cur.execute("INSERT OR IGNORE INTO bump_panel(guild_id, match_id, msg_id) VALUES(?,?,?)",
                     (ev_row["guild_id"], 0, sent.id))
         con.commit(); con.close()
@@ -651,16 +648,6 @@ def build_join_view(enabled: bool = True) -> discord.ui.View:
 
 
 # ---------------- Voting UI ----------------
-class MatchView(discord.ui.View):
-    def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str, chat_url: str | None = None):
-        timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
-        super().__init__(timeout=timeout)
-        self.match_id = match_id
-        self.btn_left.label = f"Vote {left_label}"
-        self.btn_right.label = f"Vote {right_label}"
-        if chat_url:
-            self.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=chat_url, label="Chat here"))
-
 class ChatJumpView(discord.ui.View):
     def __init__(self, chat_url: str, *, timeout: float | None = None):
         super().__init__(timeout=timeout)
@@ -671,12 +658,15 @@ class ChatJumpView(discord.ui.View):
         ))
 
 class MatchView(discord.ui.View):
-    def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str):
+    def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str, chat_url: str | None = None):
         timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
         super().__init__(timeout=timeout)
         self.match_id = match_id
         self.btn_left.label = f"Vote {left_label}"
         self.btn_right.label = f"Vote {right_label}"
+        if chat_url:
+            self.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=chat_url, label="Chat here"))
+
 
     async def _vote(self, interaction: discord.Interaction, side: str):
         try:
@@ -983,6 +973,13 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
     if not (guild and ch):
         return
 
+    # make sure the single round chat exists and get its URL
+    try:
+        await ensure_round_chat_thread(guild, ch, ev)
+    except Exception as e:
+        print("[stylo] ensure round chat failed:", e)
+    chat_url = get_round_chat_url(guild, ev["round_thread_id"]) if ("round_thread_id" in ev.keys() and ev["round_thread_id"]) else None
+
     cur.execute(
         "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
         (ev["guild_id"], round_index)
@@ -990,35 +987,37 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
     matches = cur.fetchall()
 
     for m in matches:
+        # ---- names/urls (no raises) ----
+        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
+        L = cur.fetchone()
+        cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
+        R = cur.fetchone()
+
+        Lname = L["name"] if L else "Left"
+        Rname = R["name"] if R else "Right"
+        Lurl = (L["image_url"] or "").strip() if L else ""
+        Rurl = (R["image_url"] or "").strip() if R else ""
+
+        em = discord.Embed(
+            title=f"Round {round_index} — {Lname} vs {Rname}",
+            description="Tap a button to vote. One vote per person.",
+            colour=EMBED_COLOUR
+        )
+        em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
+        em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
+
+        view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
+
+        # ---- send the primary message (ONLY this block can post a fallback) ----
         try:
-            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["left_id"],))
-            L = cur.fetchone()
-            cur.execute("SELECT name, image_url FROM entrant WHERE id=?", (m["right_id"],))
-            R = cur.fetchone()
-
-            Lname = L["name"] if L else "Left"
-            Rname = R["name"] if R else "Right"
-            Lurl = (L["image_url"] or "").strip() if L else ""
-            Rurl = (R["image_url"] or "").strip() if R else ""
-
-            em = discord.Embed(
-                title=f"Round {round_index} — {Lname} vs {Rname}",
-                description="Tap a button to vote. One vote per person.",
-                colour=EMBED_COLOUR
-            )
-            em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
-            em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
-            view = MatchView(m["id"], vote_end, Lname, Rname)
-
             msg = None
-
             if Lurl and Rurl:
                 try:
                     card = await build_vs_card(Lurl, Rurl)
                     file = discord.File(fp=card, filename="versus.png")
                     msg = await ch.send(embed=em, view=view, file=file)
-                except Exception as e:
-                    print(f"[stylo] VS card failed for match {m['id']}: {e!r}")
+                except Exception as e_card:
+                    print(f"[stylo] VS card failed for match {m['id']}: {e_card!r}")
 
             if msg is None:
                 header = await ch.send(embed=em, view=view)
@@ -1054,21 +1053,32 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
                         await ch.send(embeds=embeds, files=files)
                     else:
                         await ch.send(embeds=embeds)
-            #
-            # Attach a 'Chat here' link to the round-wide thread (if present)
-            chat_url = get_round_chat_url(guild, ev.get("round_thread_id") if hasattr(ev, "get") else ev["round_thread_id"])
-            # Rebuild the view with chat button
-            view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
+
+        except Exception as send_err:
+            # Only if the main send failed do we post a fallback ONCE
+            print(f"[stylo] send failed for match {m['id']}: {send_err!r}")
             try:
-                await msg.edit(view=view)
-            except:
-                pass
+                fallback_em = discord.Embed(
+                    title=f"Round {round_index} — {Lname} vs {Rname}",
+                    description="Images failed to load, but you can still vote.",
+                    colour=EMBED_COLOUR
+                )
+                fallback_em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
+                fallback_em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
+                view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
+                msg = await ch.send(embed=fallback_em, view=view)
+            except Exception as e2:
+                print(f"[stylo] EVEN FALLBACK failed for match {m['id']}: {e2!r}")
+                continue  # move to next match
 
+        # ---- immediately persist msg_id so we never repost this match ----
+        try:
             cur.execute("UPDATE match SET msg_id=?, thread_id=NULL WHERE id=?", (msg.id, m["id"]))
-
             con.commit()
+        except Exception as e_db:
+            print(f"[stylo] DB update failed for match {m['id']}: {e_db!r}")
 
-            await asyncio.sleep(0.25)
+        await asyncio.sleep(0.25)
 
         except Exception as e:
             print(f"[stylo] hard failure posting match {m['id']}: {e!r}")
@@ -1829,7 +1839,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
 
 
 # ---------------- Scheduler ----------------
-@tasks.loop(seconds=20)
+@tasks.loop(seconds=10)
 async def scheduler():
     now = datetime.now(timezone.utc)
 
