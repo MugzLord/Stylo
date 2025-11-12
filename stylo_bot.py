@@ -35,6 +35,8 @@ INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
+INSTANCE = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_PROJECT_ID") or "local"
+print("[stylo] instance:", INSTANCE)
 
 # ---------------- DB helpers ----------------
 def db():
