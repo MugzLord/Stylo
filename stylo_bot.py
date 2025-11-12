@@ -1006,8 +1006,10 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
         em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
 
+        chat_url = get_event_chat_url(guild, ev["round_thread_id"]) if ("round_thread_id" in ev.keys() and ev["round_thread_id"]) else None
         view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=chat_url)
 
+        
         # ---- send the primary message (ONLY this block can post a fallback) ----
         try:
             msg = None
@@ -1080,25 +1082,7 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
 
         await asyncio.sleep(0.25)
 
-        except Exception as e:
-            print(f"[stylo] hard failure posting match {m['id']}: {e!r}")
-            try:
-                fallback_em = discord.Embed(
-                    title=f"Round {round_index} — Match {m['id']}",
-                    description="Images failed to load, but you can still vote.",
-                    colour=EMBED_COLOUR
-                )
-                fallback_em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
-                fallback_em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
-                fallback_view = MatchView(m["id"], vote_end, "Left", "Right")
-                fallback_msg = await ch.send(embed=fallback_em, view=fallback_view)
-                cur.execute("UPDATE match SET msg_id=?, thread_id=? WHERE id=?", (fallback_msg.id, None, m["id"]))
-                con.commit()
-            except Exception as e2:
-                print(f"[stylo] EVEN FALLBACK failed for match {m['id']}: {e2!r}")
-            continue
-
-
+     
 async def send_stylo_status(guild: discord.Guild, ch: discord.TextChannel, ev, entries_open: bool, join_enabled: bool):
     if not ch or not entries_open:
         return
