@@ -198,7 +198,6 @@ async def cleanup_bump_panels(guild: discord.Guild, ch: discord.TextChannel | No
                 pass
     cur.execute("DELETE FROM bump_panel WHERE guild_id=?", (guild.id,))
     con.commit(); con.close()
-
 # ------------- Join modal & persistent view -------------
 async def create_or_get_entrant(guild_id: int, user: discord.Member, name: str, caption: str | None) -> int:
     con = db(); cur = con.cursor()
