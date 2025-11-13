@@ -872,30 +872,60 @@ async def scheduler():
             else (guild.system_channel if guild else None)
         )
 
-        # collect entrants
+        # collect entrants (only those who actually submitted an image)
         cur.execute(
-            "SELECT * FROM entrant WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url)<>''",
+            "SELECT * FROM entrant "
+            "WHERE guild_id=? AND image_url IS NOT NULL AND TRIM(image_url)<>''",
             (ev["guild_id"],)
         )
         entrants = cur.fetchall()
-
-        cur.execute("SELECT COUNT(*) AS c FROM entrant WHERE guild_id=?", (ev["guild_id"],))
-        total = cur.fetchone()["c"] or 0
-
-        if len(entrants) < 2:
-            if total >= 2:
-                cur.execute("SELECT * FROM entrant WHERE guild_id=?", (ev["guild_id"],))
-                entrants = cur.fetchall()
-            else:
-                cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
-                con.commit()
-                if ch:
-                    await ch.send(embed=discord.Embed(
-                        title="⛔ Stylo cancelled",
-                        description="Entries closed but there were not enough looks to start.",
+        
+        # no valid images at all
+        if len(entrants) == 0:
+            cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (ev["guild_id"],))
+            con.commit()
+            if ch:
+                await ch.send(
+                    embed=discord.Embed(
+                        title="✋ Stylo cancelled",
+                        description="Entries closed but there were no valid looks submitted.",
                         colour=discord.Colour.red()
-                    ))
-                continue
+                    )
+                )
+            continue  # go to next event
+        
+        # only one valid image → instant champion, NO PAIRS, NO TIE-BREAK
+        if len(entrants) == 1:
+            only = entrants[0]
+        
+            # mark event finished + store champion if you have that column
+            try:
+                cur.execute(
+                    "UPDATE event SET state='closed', champion_id=? WHERE guild_id=?",
+                    (only["user_id"], ev["guild_id"])
+                )
+            except Exception:
+                # fallback if you don't have champion_id column
+                cur.execute(
+                    "UPDATE event SET state='closed' WHERE guild_id=?",
+                    (ev["guild_id"],)
+                )
+            con.commit()
+        
+            if ch:
+                em = discord.Embed(
+                    title=f"👑 Stylo Champion — {ev['theme']}",
+                    description=f"Only one valid look was submitted on time.\n\nChampion: <@{only['user_id']}>",
+                    colour=EMBED_COLOUR
+                )
+                em.set_image(url=only["image_url"])
+                await ch.send(embed=em)
+        
+            continue  # stop here, don't make any matches
+
+# 2 or more valid images → normal pairing flow
+random.shuffle(entrants)
+
 
         random.shuffle(entrants)
         pairs = []
