@@ -588,6 +588,25 @@ async def _disable_all_join_buttons(ch: discord.TextChannel):
                     await msg.edit(view=build_join_view(False))
             except Exception:
                 pass
+async def lock_past_theme_chats(guild):
+    """Lock all previous Stylo theme chat threads."""
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT msg_id FROM bump_panel WHERE guild_id=?", (guild.id,))
+    rows = cur.fetchall()
+    con.close()
+
+    for r in rows:
+        for ch in guild.text_channels:
+            try:
+                msg = await ch.fetch_message(r["msg_id"])
+                thread = msg.channel
+                if isinstance(thread, discord.Thread):
+                    # Lock thread for everyone
+                    overwrites = thread.overwrites_for(guild.default_role)
+                    overwrites.send_messages = False
+                    await thread.set_permissions(guild.default_role, overwrite=overwrites)
+            except:
+                pass
 
 async def advance_to_next_round(ev, now, con, cur, guild, ch):
     gid = ev["guild_id"]
@@ -924,6 +943,10 @@ class EntrantStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         cur.execute("DELETE FROM ticket WHERE entrant_id IN (SELECT id FROM entrant WHERE guild_id=?)", (inter.guild_id,))
         cur.execute("DELETE FROM entrant WHERE guild_id=?", (inter.guild_id,))
         con.commit()
+
+        # 🔒 lock all past theme chats
+        await lock_past_theme_chats(inter.guild)
+
         cur.execute(
             "REPLACE INTO event(guild_id,theme,state,entry_end_utc,vote_hours,vote_seconds,round_index,main_channel_id,start_msg_id,round_thread_id) "
             "VALUES(?,?,?,?,?,?,?,?,?,?)",
