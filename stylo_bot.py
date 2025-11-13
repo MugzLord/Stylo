@@ -831,7 +831,7 @@ async def on_message(message: discord.Message):
             title = f"✨ Stylo: {ev['theme']}" if ev["theme"] else "✨ Stylo"
             dt = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
             em = discord.Embed(title=title,
-                               description="Entries are **OPEN** ✨\nClick **Join** to submit your look.",
+                               description="Entries are **OPEN** ✨\nTap **Join** to submit your look.",
                                colour=EMBED_COLOUR)
             em.add_field(name="Closes", value=rel_ts(dt), inline=False)
             await message.channel.send(embed=em, view=build_join_view(True))
@@ -955,7 +955,7 @@ class EntrantStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         con.commit(); con.close()
 
         em = discord.Embed(title=f"✨ Stylo: {theme}" if theme else "✨ Stylo",
-                           description="Entries are now **open**!\nClick **Join** to submit your look. Upload a square image in your ticket.",
+                           description="Entries are now **open**!\nTap **Join** to submit your entry. Upload a square image in your ticket.",
                            colour=EMBED_COLOUR)
         em.add_field(name="Entries", value=f"Open for **{humanize_seconds(entry_sec)}**\nCloses {rel_ts(entry_end)}", inline=True)
         em.add_field(name="Voting", value=f"Each round runs **{humanize_seconds(vote_sec)}**", inline=True)
@@ -1141,7 +1141,7 @@ async def scheduler():
                 await ch.send(
                     embed=discord.Embed(
                         title="✋ Stylo cancelled",
-                        description="Entries closed but there were no valid looks submitted.",
+                        description="Entries closed but there were no valid entries submitted.",
                         colour=discord.Colour.red()
                     )
                 )
@@ -1163,7 +1163,7 @@ async def scheduler():
             if ch:
                 em = discord.Embed(
                     title=f"👑 Stylo Champion — {ev['theme']}",
-                    description=f"Only one valid look was submitted on time.\n\nChampion: <@{only['user_id']}>",
+                    description=f"Only one valid entry was submitted on time.\n\nChampion: <@{only['user_id']}>",
                     colour=EMBED_COLOUR
                 )
                 em.set_image(url=only["image_url"])
