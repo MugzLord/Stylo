@@ -542,13 +542,13 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         msg = None
         try:
             if Lurl and Rurl:
-                # single composite image
+                # single composite image attached to the embed
                 card = await build_vs_card(Lurl, Rurl)
                 file = discord.File(fp=card, filename="versus.png")
                 em.set_image(url="attachment://versus.png")
                 msg = await ch.send(embed=em, view=view, file=file)
             elif Lurl or Rurl:
-                # single look only
+                # only one look has an image
                 one_url = Lurl or Rurl
                 data = await fetch_image_bytes(one_url)
                 if data:
@@ -561,7 +561,6 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         if msg is None:
             msg = await ch.send(embed=em, view=view)
 
-        # let the view know its message so it can disable buttons later
         view.message = msg
 
         cur.execute("UPDATE match SET msg_id=? WHERE id=?", (msg.id, m["id"]))
@@ -706,13 +705,15 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
                 await ch.send(embed=em, file=file)
             else:
                 await ch.send(embed=em)
-
+        
         await cleanup_bump_panels(guild, ch)
         try:
             await cleanup_tickets_for_guild(guild)
-        except NameError:
-            # if you haven't added the helper yet, this just skips it
+        except:
             pass
+    
+        # 🔓 reopen chat
+        await unlock_main_channel(guild, ch)
         return
 
     # --- CASE 3: odd winner count (>=3) -> leftover winner vs strongest loser ---
@@ -944,6 +945,9 @@ class EntrantStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         cur.execute("UPDATE event SET start_msg_id=? WHERE guild_id=?", (msg.id, inter.guild_id))
         con.commit(); con.close()
         await inter.followup.send("Stylo opened. Join is live.", ephemeral=True)
+        
+        # lock chat now
+        await lock_main_channel(inter.guild, inter.channel)
 
 @bot.tree.command(name="stylo_set_ticket_category", description="Set the category for entry tickets (admin only).")
 @app_commands.describe(category="Category to create ticket channels")
@@ -1057,6 +1061,26 @@ async def stylo_finish_round_now(inter: discord.Interaction):
     await advance_to_next_round(ev, now, con, cur, guild, ch)
     con.close()
     await inter.followup.send("Round finished.", ephemeral=True)
+
+async def lock_main_channel(guild, channel):
+    """Prevent everyone from chatting during event."""
+    overwrites = channel.overwrites_for(guild.default_role)
+    overwrites.send_messages = False
+    try:
+        await channel.set_permissions(guild.default_role, overwrite=overwrites)
+    except Exception as e:
+        print("[stylo] lock perms failed:", e)
+
+
+async def unlock_main_channel(guild, channel):
+    """Restore chat once event is over."""
+    overwrites = channel.overwrites_for(guild.default_role)
+    overwrites.send_messages = True
+    try:
+        await channel.set_permissions(guild.default_role, overwrite=overwrites)
+    except Exception as e:
+        print("[stylo] unlock perms failed:", e)
+
 
 # ------------- Scheduler -------------
 @tasks.loop(seconds=10)
