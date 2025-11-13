@@ -1278,7 +1278,7 @@ async def scheduler():
                         if Lurl and Rurl:
                             card = await build_vs_card(Lurl, Rurl)
                             file = discord.File(card, filename="tie.png")
-                      
+
                         em = discord.Embed(
                             title=f"🔁 Tie-break — {Lname} vs {Rname}",
                             description=f"Re-vote open until {rel_ts(new_end)}.",
@@ -1287,9 +1287,12 @@ async def scheduler():
                         view = MatchView(m["id"], new_end, Lname, Rname)
                         msg = await ch.send(embed=em, view=view, file=file)
                         view.message = msg
+                    except Exception as e:
+                        print("[stylo] tie announce failed:", e)
 
                 continue
 
+                
             winner_id = m["left_id"] if L > R else m["right_id"]
             cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?", (winner_id, now.isoformat(), m["id"]))
             con.commit()
