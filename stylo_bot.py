@@ -515,10 +515,13 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
 
     # winners from this round
-    cur.execute("SELECT winner_id FROM match WHERE guild_id=? AND round_index=?", (gid, cur_round))
+    cur.execute(
+        "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
+        (gid, cur_round)
+    )
     winners = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
 
-    # helper to pick opponent for leftover (strongest loser from this round)
+    # helper: pick strongest loser from this round
     def pick_opponent():
         cur.execute(
             "SELECT left_id,right_id,left_votes,right_votes,winner_id "
@@ -531,15 +534,20 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             if not m["winner_id"]:
                 continue
             if m["winner_id"] == m["left_id"]:
-                losers.append((m["right_id"], m["right_votes"], m["left_votes"] + m["right_votes"]))
+                losers.append(
+                    (m["right_id"], m["right_votes"], m["left_votes"] + m["right_votes"])
+                )
             else:
-                losers.append((m["left_id"], m["left_votes"], m["left_votes"] + m["right_votes"]))
+                losers.append(
+                    (m["left_id"], m["left_votes"], m["left_votes"] + m["right_votes"])
+                )
         if not losers:
             return None
+        # losing votes desc, then total votes desc
         losers.sort(key=lambda t: (t[1], t[2]), reverse=True)
         return losers[0][0]
 
-    # detect any entrant who has NEVER played yet (unpaired / leftover)
+    # detect any entrant that has NEVER played yet (true leftover)
     cur.execute(
         "SELECT left_id,right_id FROM match WHERE guild_id=? AND round_index<=?",
         (gid, cur_round)
@@ -557,7 +565,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     all_ids = {r["id"] for r in cur.fetchall()}
     unpaired = [pid for pid in all_ids - used_ids]
 
-    # CASE 1: one winner but there is an unpaired entrant -> special match
+    # --- CASE 1: one winner + a true leftover -> special match (3 entrants case) ---
     if len(winners) == 1 and unpaired:
         leftover = unpaired[0]
         opp = pick_opponent()
@@ -586,19 +594,26 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             # no opponent found, treat leftover as auto-advance
             winners.append(leftover)
 
-    # champion? only when exactly one player left and no unpaired entrants
+    # --- CASE 2: real champion (only one player left, no leftover anywhere) ---
     if len(winners) == 1 and not unpaired:
         champ_id = winners[0]
         cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (gid,))
         con.commit()
-        cur.execute("SELECT name,image_url,user_id FROM entrant WHERE id=?", (champ_id,))
+
+        cur.execute(
+            "SELECT name,image_url,user_id FROM entrant WHERE id=?",
+            (champ_id,)
+        )
         w = cur.fetchone()
+        winner_name = w["name"] if w else "Unknown"
+        winner_mention = f"\n<@{w['user_id']}>" if w and w["user_id"] else ""
+
         em = discord.Embed(
             title=f"👑 Stylo Champion — {ev['theme']}",
-            description=f"Winner by public vote: **{w['name'] if w else 'Unknown'}**"
-                        + (f\"\\n<@{w['user_id']}>\" if w and w['user_id'] else \"\"),
+            description=f"Winner by public vote: **{winner_name}**{winner_mention}",
             colour=discord.Colour.gold()
         )
+
         if ch:
             file = None
             if w and w["image_url"]:
@@ -612,10 +627,14 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
                 await ch.send(embed=em)
 
         await cleanup_bump_panels(guild, ch)
-        await cleanup_tickets_for_guild(guild)
+        try:
+            await cleanup_tickets_for_guild(guild)
+        except NameError:
+            # if you haven't added the helper yet, this just skips it
+            pass
         return
 
-    # CASE 2: odd winner count (>=3) -> leftover winner vs biggest loser
+    # --- CASE 3: odd winner count (>=3) -> leftover winner vs strongest loser ---
     if len(winners) % 2 == 1 and len(winners) >= 3:
         leftover = sorted(winners)[-1]
         winners = [w for w in winners if w != leftover]
@@ -644,17 +663,18 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
         else:
             winners.append(leftover)  # bye
 
-    # build next round normally
+    # --- CASE 4: normal next round ---
     if len(winners) >= 2:
         random.shuffle(winners)
         nr = cur_round + 1
         vote_end = now + timedelta(seconds=vote_sec)
+
         for i in range(0, len(winners), 2):
             if i + 1 < len(winners):
                 cur.execute(
                     "INSERT INTO match(guild_id,round_index,left_id,right_id,end_utc) "
                     "VALUES(?,?,?,?,?)",
-                    (gid, nr, winners[i], winners[i+1], vote_end.isoformat())
+                    (gid, nr, winners[i], winners[i + 1], vote_end.isoformat())
                 )
         con.commit()
         cur.execute(
