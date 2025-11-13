@@ -831,7 +831,7 @@ async def on_message(message: discord.Message):
             title = f"✨ Stylo: {ev['theme']}" if ev["theme"] else "✨ Stylo"
             dt = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
             em = discord.Embed(title=title,
-                               description="Entries are **OPEN** ✨\nTap **Join** to submit your look.",
+                               description="Entries are **OPEN** ✨\nTap **Join** to submit your entry.",
                                colour=EMBED_COLOUR)
             em.add_field(name="Closes", value=rel_ts(dt), inline=False)
             await message.channel.send(embed=em, view=build_join_view(True))
@@ -967,7 +967,7 @@ class EntrantStartModal(discord.ui.Modal, title="Start Stylo Challenge"):
         con = db(); cur = con.cursor()
         cur.execute("UPDATE event SET start_msg_id=? WHERE guild_id=?", (msg.id, inter.guild_id))
         con.commit(); con.close()
-        await inter.followup.send("Stylo opened. Join is live.", ephemeral=True)
+        await inter.followup.send("Stylo’s live and buzzing - jump in and join the fun!", ephemeral=True)
         
         # lock chat now
         await lock_main_channel(inter.guild, inter.channel)
@@ -1172,6 +1172,9 @@ async def scheduler():
             if guild:
                 await cleanup_tickets_for_guild(guild)
             continue  # stop here, don't make any matches
+            
+        if guild and ch:
+            await lock_main_channel(guild, ch)
 
         # 2 or more valid images → normal pairing flow
         random.shuffle(entrants)
