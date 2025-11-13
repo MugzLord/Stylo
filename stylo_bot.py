@@ -367,109 +367,188 @@ async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -
 
 # ------------- Voting UI -------------
 class MatchView(discord.ui.View):
-    def __init__(self, match_id: int, end_utc: datetime, left_label: str, right_label: str, chat_url: str | None = None):
+    def __init__(
+        self,
+        match_id: int,
+        end_utc: datetime,
+        left_label: str,
+        right_label: str,
+        chat_url: str | None = None,
+    ):
         timeout = max(1, int((end_utc - datetime.now(timezone.utc)).total_seconds()))
         super().__init__(timeout=timeout)
         self.match_id = match_id
+        self.message: discord.Message | None = None  # filled after send
+
         self.btn_left.label = f"Vote {left_label}"
         self.btn_right.label = f"Vote {right_label}"
         if chat_url:
-            self.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=chat_url, label="Chat here"))
+            self.add_item(
+                discord.ui.Button(
+                    style=discord.ButtonStyle.link, url=chat_url, label="Chat here"
+                )
+            )
 
     async def _vote(self, interaction: discord.Interaction, side: str):
         try:
-            con = db(); cur = con.cursor()
-            cur.execute("SELECT left_votes, right_votes, end_utc FROM match WHERE id=?", (self.match_id,))
+            con = db()
+            cur = con.cursor()
+            cur.execute(
+                "SELECT left_votes, right_votes, end_utc FROM match WHERE id=?",
+                (self.match_id,),
+            )
             row = cur.fetchone()
             if not row:
-                await interaction.response.send_message("Match not found.", ephemeral=True); return
-            end_dt = datetime.fromisoformat(row["end_utc"]).replace(tzinfo=timezone.utc)
+                await interaction.response.send_message(
+                    "Match not found.", ephemeral=True
+                )
+                return
+            end_dt = datetime.fromisoformat(row["end_utc"]).replace(
+                tzinfo=timezone.utc
+            )
             if datetime.now(timezone.utc) >= end_dt:
-                await interaction.response.send_message("Voting has ended for this match.", ephemeral=True); return
+                await interaction.response.send_message(
+                    "Voting has ended for this match.", ephemeral=True
+                )
+                return
             try:
-                cur.execute("INSERT INTO voter(match_id,user_id,side) VALUES(?,?,?)", (self.match_id, interaction.user.id, side))
+                cur.execute(
+                    "INSERT INTO voter(match_id,user_id,side) VALUES(?,?,?)",
+                    (self.match_id, interaction.user.id, side),
+                )
             except sqlite3.IntegrityError:
-                await interaction.response.send_message("You’ve already voted here.", ephemeral=True); return
+                await interaction.response.send_message(
+                    "You’ve already voted here.", ephemeral=True
+                )
+                return
             if side == "L":
-                cur.execute("UPDATE match SET left_votes=left_votes+1 WHERE id=?", (self.match_id,))
+                cur.execute(
+                    "UPDATE match SET left_votes=left_votes+1 WHERE id=?",
+                    (self.match_id,),
+                )
             else:
-                cur.execute("UPDATE match SET right_votes=right_votes+1 WHERE id=?", (self.match_id,))
+                cur.execute(
+                    "UPDATE match SET right_votes=right_votes+1 WHERE id=?",
+                    (self.match_id,),
+                )
             con.commit()
-            cur.execute("SELECT left_votes,right_votes FROM match WHERE id=?", (self.match_id,))
-            m = cur.fetchone(); L, R = m["left_votes"], m["right_votes"]; total = L+R
+            cur.execute(
+                "SELECT left_votes,right_votes FROM match WHERE id=?",
+                (self.match_id,),
+            )
+            m = cur.fetchone()
+            L, R = m["left_votes"], m["right_votes"]
+            total = L + R
         finally:
-            try: con.close()
-            except: pass
+            try:
+                con.close()
+            except:
+                pass
 
         if interaction.message and interaction.message.embeds:
             em = interaction.message.embeds[0]
             if em.fields:
-                em.set_field_at(0, name="Live totals", value=f"Total votes: **{total}**", inline=False)
+                em.set_field_at(
+                    0,
+                    name="Live totals",
+                    value=f"Total votes: **{total}**",
+                    inline=False,
+                )
             else:
-                em.add_field(name="Live totals", value=f"Total votes: **{total}**", inline=False)
+                em.add_field(
+                    name="Live totals",
+                    value=f"Total votes: **{total}**",
+                    inline=False,
+                )
             await interaction.response.edit_message(embed=em, view=self)
         else:
             await interaction.response.edit_message(view=self)
 
-        pa = math.floor((L/total)*100) if total else 0
+        pa = math.floor((L / total) * 100) if total else 0
         if total >= 2:
-            if pa >= 80: banter = "That’s a rinse."
-            elif pa >= 65: banter = "Crowd’s leaning that way."
-            elif 45 <= pa <= 55: banter = "Neck and neck."
-            else: banter = "Backing the underdog."
+            if pa >= 80:
+                banter = "That’s a rinse."
+            elif pa >= 65:
+                banter = "Crowd’s leaning that way."
+            elif 45 <= pa <= 55:
+                banter = "Neck and neck."
+            else:
+                banter = "Backing the underdog."
         else:
             banter = "Vote registered."
         await interaction.followup.send(banter, ephemeral=True)
 
     @discord.ui.button(style=discord.ButtonStyle.success, custom_id="stylo:vote_left")
-    async def btn_left(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+    async def btn_left(
+        self, interaction: discord.Interaction, _btn: discord.ui.Button
+    ):
         await self._vote(interaction, "L")
 
     @discord.ui.button(style=discord.ButtonStyle.danger, custom_id="stylo:vote_right")
-    async def btn_right(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+    async def btn_right(
+        self, interaction: discord.Interaction, _btn: discord.ui.Button
+    ):
         await self._vote(interaction, "R")
 
     async def on_timeout(self):
+        # disable all non-link buttons when time is up
         for c in self.children:
-            if isinstance(c, discord.ui.Button):
+            if isinstance(c, discord.ui.Button) and c.style != discord.ButtonStyle.link:
                 c.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+
 
 # ------------- Posting matches -------------
 async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur):
     guild = bot.get_guild(ev["guild_id"])
     ch = guild.get_channel(ev["main_channel_id"]) if (guild and ev["main_channel_id"]) else (guild.system_channel if guild else None)
-    if not (guild and ch): return
+    if not (guild and ch):
+        return
 
     th_id = await ensure_event_chat_thread(guild, ch, ev)
     url = chat_jump_url(guild, th_id)
 
-    cur.execute("SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
-                (ev["guild_id"], round_index))
+    cur.execute(
+        "SELECT * FROM match WHERE guild_id=? AND round_index=? AND msg_id IS NULL",
+        (ev["guild_id"], round_index)
+    )
     rows = cur.fetchall()
 
     for m in rows:
-        cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["left_id"],)); L = cur.fetchone()
-        cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["right_id"],)); R = cur.fetchone()
-        Lname = (L["name"] if L else "Left"); Rname = (R["name"] if R else "Right")
-        Lurl = (L["image_url"] or "").strip() if L else ""; Rurl = (R["image_url"] or "").strip() if R else ""
+        cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["left_id"],))
+        L = cur.fetchone()
+        cur.execute("SELECT name,image_url FROM entrant WHERE id=?", (m["right_id"],))
+        R = cur.fetchone()
+
+        Lname = (L["name"] if L else "Left")
+        Rname = (R["name"] if R else "Right")
+        Lurl = (L["image_url"] or "").strip() if L else ""
+        Rurl = (R["image_url"] or "").strip() if R else ""
 
         em = discord.Embed(
             title=f"Round {round_index} — {Lname} vs {Rname}",
             description="Tap a button to vote. One vote per person.",
-            colour=EMBED_COLOUR
+            colour=EMBED_COLOUR,
         )
         em.add_field(name="Live totals", value="Total votes: **0**", inline=False)
         em.add_field(name="Closes", value=rel_ts(vote_end), inline=False)
+
         view = MatchView(m["id"], vote_end, Lname, Rname, chat_url=url)
 
         msg = None
         try:
             if Lurl and Rurl:
+                # single composite image
                 card = await build_vs_card(Lurl, Rurl)
                 file = discord.File(fp=card, filename="versus.png")
                 em.set_image(url="attachment://versus.png")
                 msg = await ch.send(embed=em, view=view, file=file)
             elif Lurl or Rurl:
+                # single look only
                 one_url = Lurl or Rurl
                 data = await fetch_image_bytes(one_url)
                 if data:
@@ -482,6 +561,8 @@ async def post_round_matches(ev, round_index: int, vote_end: datetime, con, cur)
         if msg is None:
             msg = await ch.send(embed=em, view=view)
 
+        # let the view know its message so it can disable buttons later
+        view.message = msg
 
         cur.execute("UPDATE match SET msg_id=? WHERE id=?", (msg.id, m["id"]))
         con.commit()
@@ -797,6 +878,7 @@ async def bump_voting_panels(guild: discord.Guild, ch: discord.TextChannel, ev_r
 
             try:
                 sent = await ch.send(embed=em, view=view)
+                view.message = sent
                 # remember we already bumped this match so we won't do it again
                 cur.execute("INSERT OR IGNORE INTO bump_panel(guild_id, match_id, msg_id) VALUES(?,?,?)",
                             (ev_row["guild_id"], m["id"], sent.id))
@@ -936,17 +1018,26 @@ async def stylo_finish_round_now(inter: discord.Interaction):
                 view = MatchView(m["id"], new_end, Lname, Rname)
                 if Lurl and Rurl:
                     card = await build_vs_card(Lurl, Rurl)
-                    await ch.send(embed=discord.Embed(
-                        title=f"🔁 Tie-break — {Lname} vs {Rname}",
-                        description=f"Re-vote open until {rel_ts(new_end)}.",
-                        colour=discord.Colour.orange()
-                    ), file=discord.File(card, filename="tie.png"), view=view)
+                    msg = await ch.send(
+                        embed=discord.Embed(
+                            title=f"🔁 Tie-break — {Lname} vs {Rname}",
+                            description=f"Re-vote open until {rel_ts(new_end)}.",
+                            colour=discord.Colour.orange(),
+                        ),
+                        file=discord.File(card, filename="tie.png"),
+                        view=view,
+                    )
                 else:
-                    await ch.send(embed=discord.Embed(
-                        title=f"🔁 Tie-break — {Lname} vs {Rname}",
-                        description=f"Re-vote open until {rel_ts(new_end)}.",
-                        colour=discord.Colour.orange()
-                    ), view=view)
+                    msg = await ch.send(
+                        embed=discord.Embed(
+                            title=f"🔁 Tie-break — {Lname} vs {Rname}",
+                            description=f"Re-vote open until {rel_ts(new_end)}.",
+                            colour=discord.Colour.orange(),
+                        ),
+                        view=view,
+                    )
+                view.message = msg
+
             continue
         winner_id = m["left_id"] if L > R else m["right_id"]
         cur.execute("UPDATE match SET winner_id=?, end_utc=? WHERE id=?", (winner_id, now.isoformat(), m["id"]))
@@ -1187,14 +1278,16 @@ async def scheduler():
                         if Lurl and Rurl:
                             card = await build_vs_card(Lurl, Rurl)
                             file = discord.File(card, filename="tie.png")
+                      
                         em = discord.Embed(
                             title=f"🔁 Tie-break — {Lname} vs {Rname}",
                             description=f"Re-vote open until {rel_ts(new_end)}.",
                             colour=discord.Colour.orange()
                         )
-                        await ch.send(embed=em, view=MatchView(m["id"], new_end, Lname, Rname), file=file)
-                    except Exception as e:
-                        print("[stylo] tie announce failed:", e)
+                        view = MatchView(m["id"], new_end, Lname, Rname)
+                        msg = await ch.send(embed=em, view=view, file=file)
+                        view.message = msg
+
                 continue
 
             winner_id = m["left_id"] if L > R else m["right_id"]
