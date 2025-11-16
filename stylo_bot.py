@@ -8,6 +8,7 @@ from PIL import Image, ImageOps, ImageDraw
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from discord.abc import Messageable
 
 # ------------- Config -------------
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -354,7 +355,7 @@ async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -
     row = cur.fetchone(); con.close()
     if not row: return None
     ch = guild.get_channel(row["channel_id"])
-    if not isinstance(ch, discord.TextChannel): return None
+        if not isinstance(ch, discord.TextChannel): return None
     async for msg in ch.history(limit=200, oldest_first=False):
         if msg.author.bot: continue
         for a in msg.attachments:
