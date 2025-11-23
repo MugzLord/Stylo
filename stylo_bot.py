@@ -737,9 +737,16 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
         return
 
     # --- CASE 3: odd winner count (>=3) -> leftover winner vs strongest loser ---
+    # --- CASE 3: odd winner count (>=3) -> use TRUE leftover (never played) if possible ---
     if len(winners) % 2 == 1 and len(winners) >= 3:
-        leftover = sorted(winners)[-1]
-        winners = [w for w in winners if w != leftover]
+        # If we have someone who has never played yet (e.g. 7 entrants with 3 matches),
+        # use THAT person in the special match instead of reusing a winner.
+        if unpaired:
+            leftover = unpaired[0]
+        else:
+            # Fallback: old behaviour – pick one winner as the "leftover"
+            leftover = sorted(winners)[-1]
+
         opp = pick_opponent()
         if opp is not None:
             vote_end2 = now + timedelta(seconds=vote_sec)
@@ -763,7 +770,8 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             await post_round_matches(ev, cur_round, vote_end2, con, cur)
             return
         else:
-            winners.append(leftover)  # bye
+            # No suitable opponent – treat leftover as having a bye
+            winners.append(leftover)
 
     # --- CASE 4: normal next round ---
     if len(winners) >= 2:
