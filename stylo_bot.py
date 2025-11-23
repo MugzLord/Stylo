@@ -350,21 +350,34 @@ async def build_vs_card(left_url: str, right_url: str, width: int = 1200, gap: i
     return out
 
 async def fetch_latest_ticket_image_url(guild: discord.Guild, entrant_id: int) -> str | None:
-    con = db(); cur = con.cursor()
+    con = db()
+    cur = con.cursor()
     cur.execute("SELECT channel_id FROM ticket WHERE entrant_id=?", (entrant_id,))
-    row = cur.fetchone(); con.close()
-    if not row: return None
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return None
+
     ch = guild.get_channel(row["channel_id"])
-        if not isinstance(ch, discord.TextChannel): return None
+    if not isinstance(ch, discord.TextChannel):
+        return None
+
     async for msg in ch.history(limit=200, oldest_first=False):
-        if msg.author.bot: continue
+        if msg.author.bot:
+            continue
         for a in msg.attachments:
             ctype_ok = (a.content_type or "").startswith("image/")
             name = (a.filename or "").lower().split("?")[0]
-            ext = name.rsplit(".",1)[-1] if "." in name else ""
-            if ctype_ok or ext in {"png","jpg","jpeg","gif","webp","heic","heif","bmp","tif","tiff"}:
+            ext = name.rsplit(".", 1)[-1] if "." in name else ""
+            if ctype_ok or ext in {
+                "png", "jpg", "jpeg", "gif", "webp", "heic",
+                "heif", "bmp", "tif", "tiff"
+            }:
                 return a.url
+
     return None
+
 
 # ------------- Voting UI -------------
 class MatchView(discord.ui.View):
