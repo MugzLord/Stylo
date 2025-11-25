@@ -627,14 +627,21 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     cur_round = ev["round_index"]
     vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
 
-    # winners from this round
+    # winners from this round (de-duped so same ID can't appear twice)
     cur.execute(
         "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
         (gid, cur_round)
     )
-    winners = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
+    winners_raw = [r["winner_id"] for r in cur.fetchall() if r["winner_id"]]
 
-    # helper: pick strongest loser from this round
+    seen = set()
+    winners: list[int] = []
+    for wid in winners_raw:
+        if wid and wid not in seen:
+            seen.add(wid)
+            winners.append(wid)
+
+    # helper: pick strongest loser from THIS round
     def pick_opponent():
         cur.execute(
             "SELECT left_id,right_id,left_votes,right_votes,winner_id "
@@ -660,7 +667,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
         losers.sort(key=lambda t: (t[1], t[2]), reverse=True)
         return losers[0][0]
 
-    # detect any entrant that has NEVER played yet (true leftover)
+    # detect any entrant that has NEVER played yet (true leftover from odd entrants)
     cur.execute(
         "SELECT left_id,right_id FROM match WHERE guild_id=? AND round_index<=?",
         (gid, cur_round)
@@ -678,8 +685,12 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     all_ids = {r["id"] for r in cur.fetchall()}
     unpaired = [pid for pid in all_ids - used_ids]
 
-    # --- CASE 1: one winner + a true leftover -> special match (3 entrants case) ---
-    if len(winners) == 1 and unpaired:
+    # ===== ROUND 1 SPECIAL: leftover odd entrant vs Round 1 loser =====
+    # Rule:
+    # - Only in round 1
+    # - If there is a true leftover (odd entrant who never played yet),
+    #   they do a Special Match vs strongest loser from Round 1.
+    if cur_round == 1 and unpaired:
         leftover = unpaired[0]
         opp = pick_opponent()
         if opp is not None:
@@ -698,16 +709,17 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             if ch:
                 await ch.send(embed=discord.Embed(
                     title="🆚 Stylo — Special Match",
-                    description="Odd number of looks: leftover battles a wildcard for a place in the next round.",
+                    description="Odd entrant battles a Round 1 loser for a place in the next round.",
                     colour=EMBED_COLOUR
                 ))
             await post_round_matches(ev, cur_round, vote_end2, con, cur)
             return
         else:
-            # no opponent found, treat leftover as auto-advance
+            # no loser to fight – treat leftover as auto-advance into winners
             winners.append(leftover)
+            seen.add(leftover)
 
-    # --- CASE 2: real champion (only one player left, no leftover anywhere) ---
+    # ===== REAL CHAMPION: only one winner left and no leftovers =====
     if len(winners) == 1 and not unpaired:
         champ_id = winners[0]
         cur.execute("UPDATE event SET state='closed' WHERE guild_id=?", (gid,))
@@ -749,17 +761,11 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
         await unlock_main_channel(guild, ch)
         return
 
-    # --- CASE 3: odd winner count (>=3) -> leftover winner vs strongest loser ---
-    # --- CASE 3: odd winner count (>=3) -> use TRUE leftover (never played) if possible ---
-    if len(winners) % 2 == 1 and len(winners) >= 3:
-        # If we have someone who has never played yet (e.g. 7 entrants with 3 matches),
-        # use THAT person in the special match instead of reusing a winner.
-        if unpaired:
-            leftover = unpaired[0]
-        else:
-            # Fallback: old behaviour – pick one winner as the "leftover"
-            leftover = sorted(winners)[-1]
-
+    # ===== ROUND 2+ SPECIALS: odd winners only =====
+    # From round 2 onwards, specials are triggered by ODD WINNERS from the previous round.
+    if cur_round >= 2 and len(winners) % 2 == 1 and len(winners) >= 3:
+        # pick one winner as leftover (e.g. last one after sort)
+        leftover = sorted(winners)[-1]
         opp = pick_opponent()
         if opp is not None:
             vote_end2 = now + timedelta(seconds=vote_sec)
@@ -783,10 +789,10 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             await post_round_matches(ev, cur_round, vote_end2, con, cur)
             return
         else:
-            # No suitable opponent – treat leftover as having a bye
-            winners.append(leftover)
+            # no suitable opponent – leftover effectively gets a bye into the winners list
+            pass
 
-    # --- CASE 4: normal next round ---
+    # ===== NORMAL NEXT ROUND =====
     if len(winners) >= 2:
         random.shuffle(winners)
         nr = cur_round + 1
