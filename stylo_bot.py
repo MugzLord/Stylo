@@ -627,7 +627,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
     cur_round = ev["round_index"]
     vote_sec = ev["vote_seconds"] if ev["vote_seconds"] else int(ev["vote_hours"]) * 3600
 
-    # winners from this round (de-duped so same ID can't appear twice)
+    # winners from this round (de-duped so one player can't appear twice)
     cur.execute(
         "SELECT winner_id FROM match WHERE guild_id=? AND round_index=?",
         (gid, cur_round)
@@ -818,6 +818,7 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
                 colour=EMBED_COLOUR
             ))
         await post_round_matches(ev, nr, vote_end, con, cur)
+
 
 # ------------- Message listener (capture uploads + bump panels) -------------
 @bot.event
