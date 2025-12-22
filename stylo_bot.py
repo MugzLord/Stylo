@@ -819,7 +819,6 @@ async def advance_to_next_round(ev, now, con, cur, guild, ch):
             ))
         await post_round_matches(ev, nr, vote_end, con, cur)
 
-
 # ------------- Message listener (capture uploads + bump panels) -------------
 @bot.event
 async def on_message(message: discord.Message):
