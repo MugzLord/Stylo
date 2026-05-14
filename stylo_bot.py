@@ -14,6 +14,16 @@ if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
 DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
+
+# 🚨 FIX: Force-create the /data directory if it doesn't exist yet
+db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+if db_dir and not os.path.exists(db_dir):
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+        print(f"Successfully created database directory: {db_dir}")
+    except Exception as e:
+        print(f"CRITICAL: Failed to create directory {db_dir}. Error: {e}")
+
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
 STYLO_CHAT_BUMP_LIMIT = 10
