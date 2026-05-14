@@ -15,7 +15,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
-DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
+DB_PATH = os.getenv("STYLO_DB_PATH", "/tmp/stylo.db")
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
 MAIN_CHAT_CHANNEL_ID = int(os.getenv("STYLO_MAIN_CHAT_ID", "0"))  # optional
