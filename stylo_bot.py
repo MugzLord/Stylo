@@ -16,16 +16,6 @@ if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
 DB_PATH = os.getenv("STYLO_DB_PATH", "stylo.db")
-
-# 🚨 FIX: Force-create the database directory structure before init_db() runs
-db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-if db_dir and not os.path.exists(db_dir):
-    try:
-        os.makedirs(db_dir, exist_ok=True)
-        print(f"[stylo] Created directory: {db_dir}")
-    except Exception as e:
-        print(f"[stylo] CRITICAL directory error: {e}")
-
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
 MAIN_CHAT_CHANNEL_ID = int(os.getenv("STYLO_MAIN_CHAT_ID", "0"))  # optional
@@ -866,7 +856,7 @@ async def on_message(message: discord.Message):
         stylo_chat_counters[cid] = 0
         if ev["state"] == "entry":
             # resend compact join panel
-            title = f"✨ Stylo: {ev['theme']}" if ev['theme'] else "✨ Stylo"
+            title = f"✨ Stylo: {ev['theme']}" if ev["theme"] else "✨ Stylo"
             dt = datetime.fromisoformat(ev["entry_end_utc"]).replace(tzinfo=timezone.utc)
             em = discord.Embed(title=title,
                                description="Entries are **OPEN** ✨\nTap **Join** to submit your entry.",
@@ -1435,6 +1425,11 @@ async def setup_hook():
     # sync commands and start scheduler here (fixes NameError on on_ready)
     try:
         await bot.tree.sync()
+        for g in bot.guilds:
+            try:
+                await bot.tree.sync(guild=discord.Object(id=g.id))
+            except Exception as e:
+                print("Guild sync err:", g.id, e)
     except Exception as e:
         print("Slash sync error:", e)
     if not scheduler.is_running():
