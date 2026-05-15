@@ -15,7 +15,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
-DB_PATH = os.getenv("STYLO_DB_PATH", "/tmp/stylo.db")
+# FIX: Ensure we use a writable directory and an absolute path
+# Defaulting to /tmp/stylo.db ensures it boots on Railway even without a Volume
+DB_PATH = os.path.abspath(os.getenv("STYLO_DB_PATH", "/tmp/stylo.db"))
 EMBED_COLOUR = discord.Colour.from_rgb(224, 64, 255)
 
 MAIN_CHAT_CHANNEL_ID = int(os.getenv("STYLO_MAIN_CHAT_ID", "0"))  # optional
@@ -36,6 +38,8 @@ print("[stylo] instance:", INSTANCE)
 
 # ------------- DB helpers -------------
 def db():
+    # FIX: Create directory if it doesn't exist (required for mounted Volumes)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
@@ -108,6 +112,7 @@ def init_db():
     );
     """)
     con.commit(); con.close()
+# Call init_db immediately as in original
 init_db()
 
 # ------------- Utils -------------
